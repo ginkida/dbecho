@@ -46,25 +46,6 @@ What makes it different from just giving an agent a connection string:
 - **Agent-optimized output.** Schema, stats, and query results are formatted so LLMs parse them efficiently, not as raw psql dumps.
 - **Zero infrastructure.** No containers, no web UI, no background processes. A Python package that speaks MCP over stdio.
 
-## Real-world example
-
-Connected to a blog database (29 tables, 34 MB), asked Claude to analyze post performance:
-
-```
-You: Analyze my blog posts and tell me what topics I should write about.
-```
-
-Claude autonomously ran 15+ queries across `post_posts`, `post_engagements`, `post_reactions`, `tags`, `topics`, `subscribers`, and `comment_comments`. Discovered:
-
-- Posts with brand names in titles average 1800-3000 views (vs 400 without)
-- 63% of readers leave in the first quarter of a post
-- Investigation-style posts get 80-100% engagement rate
-- 87% of 32,754 unique visitors never return (retention problem)
-- Only 47 subscribers from all that traffic (0.07% conversion)
-- Email bounce rate of 83% among confirmed subscribers
-
-That's the kind of analysis that takes hours manually. dbecho made it a conversation.
-
 ## Quick start
 
 ### 1. Install
