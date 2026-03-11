@@ -1,7 +1,7 @@
 # dbecho
 
 <p align="center">
-  <img src="https://minio.ginkida.dev/minion/github/dbecho.png" alt="dbecho mascot" width="200">
+  <img src="https://minio.ginkida.dev/minion/github/dbecho.png" alt="dbecho mascot" width="400" height="400">
 </p>
 
 > Talk to your PostgreSQL databases through AI. No dashboards, no BI tools, just questions and answers.
