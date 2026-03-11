@@ -1,5 +1,9 @@
 # dbecho
 
+<p align="center">
+  <img src="https://minio.ginkida.dev/minion/github/dbecho.png" alt="dbecho mascot" width="200">
+</p>
+
 > Talk to your PostgreSQL databases through AI. No dashboards, no BI tools, just questions and answers.
 
 **dbecho** is an [MCP server](https://modelcontextprotocol.io/) that gives AI agents (Claude Code, Cursor, Windsurf, or any MCP client) direct read-only access to your PostgreSQL databases. Point it at your databases, ask questions in plain language, get instant analytics.
