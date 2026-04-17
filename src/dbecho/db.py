@@ -49,6 +49,126 @@ _ALLOWED_SQL_PREFIXES = ("SELECT", "WITH", "SHOW")
 _MAX_COLUMNS_FOR_STATS = 80
 
 
+def _strip_strings_and_comments(sql: str) -> str:
+    """Replace SQL string literals, quoted identifiers, and comments with
+    single spaces so structural checks don't trip on their content.
+
+    Handles: single-quoted strings (with '' escape), double-quoted identifiers
+    (with "" escape), dollar-quoted strings ($tag$...$tag$), line comments
+    (-- to end of line), block comments (/* ... */, nested).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "-" and i + 1 < n and sql[i + 1] == "-":
+            while i < n and sql[i] != "\n":
+                i += 1
+            out.append(" ")
+            continue
+        if c == "/" and i + 1 < n and sql[i + 1] == "*":
+            depth = 1
+            i += 2
+            while i + 1 < n and depth > 0:
+                if sql[i] == "/" and sql[i + 1] == "*":
+                    depth += 1
+                    i += 2
+                elif sql[i] == "*" and sql[i + 1] == "/":
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            out.append(" ")
+            continue
+        if c == "'":
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            out.append(" ")
+            continue
+        if c == '"':
+            i += 1
+            while i < n:
+                if sql[i] == '"':
+                    if i + 1 < n and sql[i + 1] == '"':
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            out.append(" ")
+            continue
+        if c == "$":
+            j = i + 1
+            while j < n and (sql[j] == "_" or sql[j].isalnum()):
+                j += 1
+            if j < n and sql[j] == "$":
+                tag = sql[i : j + 1]
+                k = j + 1
+                while k < n:
+                    if sql[k : k + len(tag)] == tag:
+                        k += len(tag)
+                        break
+                    k += 1
+                i = k
+                out.append(" ")
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _validate_explain_body(clean: str) -> None:
+    """Enforce: the body of EXPLAIN ANALYZE must be SELECT/WITH/SHOW.
+
+    Handles both `EXPLAIN ANALYZE body` and `EXPLAIN (ANALYZE, ...) body`.
+    Plain EXPLAIN (no ANALYZE) isn't checked — it only plans, doesn't execute.
+    """
+    rest = clean[len("EXPLAIN") :].lstrip()
+    has_analyze = False
+    if rest.startswith("("):
+        depth = 1
+        j = 1
+        while j < len(rest) and depth > 0:
+            if rest[j] == "(":
+                depth += 1
+            elif rest[j] == ")":
+                depth -= 1
+            j += 1
+        opts = rest[1 : j - 1] if j > 1 else ""
+        if re.search(r"\bANALY[SZ]E\b", opts, re.IGNORECASE):
+            has_analyze = True
+        rest = rest[j:].lstrip()
+    tokens = rest.split(None, 1)
+    if tokens and tokens[0].upper() in ("ANALYZE", "ANALYSE"):
+        has_analyze = True
+        rest = tokens[1] if len(tokens) > 1 else ""
+    if has_analyze:
+        body_word = rest.split(None, 1)[0].upper() if rest else ""
+        if body_word and body_word not in ("SELECT", "WITH", "SHOW"):
+            raise ValueError("EXPLAIN ANALYZE is only allowed with SELECT queries")
+
+
+def _looks_like_identifier_column(name: str) -> bool:
+    """Columns where duplicates suggest a data-quality issue.
+
+    Matches `id` exactly (not `*_id`, which are FK columns and legitimately
+    duplicate), or `email`/`uuid` as whole tokens in an underscore-split name.
+    """
+    lower = name.lower()
+    if lower == "id":
+        return True
+    parts = lower.split("_")
+    return any(p in {"email", "uuid"} for p in parts)
+
+
 @dataclass
 class QueryResult:
     columns: list[str]
@@ -204,18 +324,16 @@ class DatabaseManager:
         stripped = sql.strip().rstrip(";").strip()
         if not stripped:
             raise ValueError("Empty query")
-        if ";" in stripped:
+
+        clean = _strip_strings_and_comments(stripped).strip()
+        if not clean:
+            raise ValueError("Empty query")
+        if ";" in clean:
             raise ValueError("Multiple statements are not allowed")
-        first_word = stripped.split()[0].upper()
+
+        first_word = clean.split()[0].upper()
         if first_word == "EXPLAIN":
-            tokens = stripped.split(None, 3)
-            if len(tokens) >= 2 and tokens[1].upper() in ("ANALYZE", "ANALYSE"):
-                inner = tokens[2].upper() if len(tokens) > 2 else ""
-                if inner and inner not in ("SELECT", "WITH", "SHOW"):
-                    raise ValueError(
-                        "EXPLAIN ANALYZE is only allowed with SELECT queries"
-                    )
-            # plain EXPLAIN is ok
+            _validate_explain_body(clean)
         elif first_word not in _ALLOWED_SQL_PREFIXES:
             raise ValueError(
                 f"Only SELECT/WITH/EXPLAIN/SHOW queries allowed, got: {first_word}"
@@ -251,7 +369,7 @@ class DatabaseManager:
 
     def get_schema(self, database: str, use_cache: bool = False) -> list[TableInfo]:
         if use_cache and database in self._schema_cache:
-            return self._schema_cache[database]
+            return list(self._schema_cache[database])
 
         db = self.get_database(database)
 
@@ -330,7 +448,7 @@ class DatabaseManager:
             )
 
         if use_cache:
-            self._schema_cache[database] = tables
+            self._schema_cache[database] = list(tables)
         return tables
 
     def get_foreign_keys(self, database: str) -> list[ForeignKey]:
@@ -735,7 +853,7 @@ class DatabaseManager:
                     # Possible duplicates on unique-looking columns
                     if distinct == row_count - null_count and distinct > 10:
                         pass  # Looks unique, no anomaly
-                    elif "id" in col_name.lower() or "email" in col_name.lower():
+                    elif _looks_like_identifier_column(col_name):
                         dup_count = row_count - null_count - distinct
                         if dup_count > 0:
                             anomalies.append(

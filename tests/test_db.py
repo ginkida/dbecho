@@ -124,6 +124,52 @@ class TestValidateSql:
     def test_case_insensitive(self):
         assert DatabaseManager.validate_sql("select 1") == "select 1"
 
+    def test_semicolon_in_string_literal_passes(self):
+        assert (
+            DatabaseManager.validate_sql("SELECT 'a;b' FROM t") == "SELECT 'a;b' FROM t"
+        )
+
+    def test_escaped_quote_in_string_passes(self):
+        result = DatabaseManager.validate_sql("SELECT 'he''llo' AS x")
+        assert "he''llo" in result
+
+    def test_leading_line_comment_passes(self):
+        result = DatabaseManager.validate_sql("-- hello\nSELECT 1")
+        assert "SELECT 1" in result
+
+    def test_leading_block_comment_passes(self):
+        result = DatabaseManager.validate_sql("/* hello */ SELECT 1")
+        assert "SELECT 1" in result
+
+    def test_nested_block_comment_passes(self):
+        result = DatabaseManager.validate_sql("/* /* nested */ */ SELECT 1")
+        assert "SELECT 1" in result
+
+    def test_dollar_quoted_string_with_semicolon_passes(self):
+        result = DatabaseManager.validate_sql("SELECT $$a;b$$ AS x")
+        assert "$$a;b$$" in result
+
+    def test_dollar_quoted_tagged_string_passes(self):
+        result = DatabaseManager.validate_sql("SELECT $tag$a;b$tag$ AS x")
+        assert "$tag$" in result
+
+    def test_explain_paren_analyze_delete_blocked(self):
+        with pytest.raises(ValueError, match="only allowed with SELECT"):
+            DatabaseManager.validate_sql("EXPLAIN (ANALYZE) DELETE FROM users")
+
+    def test_explain_paren_analyze_buffers_select_passes(self):
+        result = DatabaseManager.validate_sql("EXPLAIN (ANALYZE, BUFFERS) SELECT 1")
+        assert result.startswith("EXPLAIN")
+
+    def test_explain_paren_format_json_select_passes(self):
+        result = DatabaseManager.validate_sql("EXPLAIN (FORMAT JSON) SELECT 1")
+        assert result.startswith("EXPLAIN")
+
+    def test_explain_plain_delete_still_allowed(self):
+        # Plain EXPLAIN only plans (doesn't execute), so any body is fine.
+        result = DatabaseManager.validate_sql("EXPLAIN DELETE FROM users")
+        assert result.startswith("EXPLAIN")
+
 
 class TestIdentifierValidation:
     def test_valid_identifiers(self):
@@ -329,9 +375,14 @@ class TestGetSchema:
         assert tables[0].columns[0].name == "id"
         assert tables[0].columns[0].is_primary_key
 
-        # Second call uses cache — no new DB calls
+        # Second call uses cache (no new DB calls) but returns a fresh copy
+        # so callers can't corrupt the cache by mutating the list.
         tables2 = mgr.get_schema("test", use_cache=True)
-        assert tables2 is tables
+        assert tables2 is not tables
+        assert tables2 == tables
+        tables.append("INJECTED")
+        tables3 = mgr.get_schema("test", use_cache=True)
+        assert "INJECTED" not in tables3
 
     def test_schema_default_is_fresh(self):
         cur = MagicMock()
@@ -571,6 +622,86 @@ class TestFindAnomalies:
         mgr = make_manager()
         with pytest.raises(ValueError, match="Invalid identifier"):
             mgr.find_anomalies("test", "bad;table")
+
+    def test_id_substring_not_flagged_as_duplicate(self):
+        # 'paid' contains 'id' as substring but is not an identifier column.
+        cur = MagicMock()
+        cur.fetchone = MagicMock(
+            side_effect=[
+                (1,),  # table exists
+                (100,),  # row count
+                (0,),  # null count for 'paid'
+                (50,),  # distinct for 'paid' — not unique
+            ]
+        )
+        cur.fetchall = MagicMock(side_effect=[[("paid", "boolean")]])
+
+        with mock_connection(cur):
+            mgr = make_manager()
+            result = mgr.find_anomalies("test", "orders")
+
+        types = [a["type"] for a in result["anomalies"]]
+        assert "possible_duplicates" not in types
+
+    def test_fk_style_id_column_not_flagged_as_duplicate(self):
+        # 'user_id' is an FK; duplicates are legitimate, not an anomaly.
+        cur = MagicMock()
+        cur.fetchone = MagicMock(
+            side_effect=[
+                (1,),  # table exists
+                (100,),  # row count
+                (0,),  # null count
+                (12,),  # distinct
+                (None, None),  # percentile_cont — skip IQR
+            ]
+        )
+        cur.fetchall = MagicMock(side_effect=[[("user_id", "integer")]])
+
+        with mock_connection(cur):
+            mgr = make_manager()
+            result = mgr.find_anomalies("test", "posts")
+
+        types = [a["type"] for a in result["anomalies"]]
+        assert "possible_duplicates" not in types
+
+    def test_email_column_flagged_as_duplicate(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(
+            side_effect=[
+                (1,),  # table exists
+                (100,),  # row count
+                (0,),  # null count
+                (50,),  # distinct — duplicates present
+            ]
+        )
+        cur.fetchall = MagicMock(side_effect=[[("user_email", "text")]])
+
+        with mock_connection(cur):
+            mgr = make_manager()
+            result = mgr.find_anomalies("test", "users")
+
+        types = [a["type"] for a in result["anomalies"]]
+        assert "possible_duplicates" in types
+
+    def test_bare_id_column_flagged_as_duplicate(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(
+            side_effect=[
+                (1,),  # table exists
+                (100,),  # row count
+                (0,),  # null count
+                (80,),  # distinct — duplicates present
+                (None, None),  # percentile_cont — skip IQR
+            ]
+        )
+        cur.fetchall = MagicMock(side_effect=[[("id", "integer")]])
+
+        with mock_connection(cur):
+            mgr = make_manager()
+            result = mgr.find_anomalies("test", "users")
+
+        types = [a["type"] for a in result["anomalies"]]
+        assert "possible_duplicates" in types
 
 
 class TestTimeoutBudget:

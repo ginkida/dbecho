@@ -195,6 +195,32 @@ url = "${DEFINITELY_NOT_SET_12345}"
         load_config(p)
 
 
+def test_unknown_database_key_rejected(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+descreption = "typo"
+""",
+    )
+    with pytest.raises(ValueError, match="unknown keys.*descreption"):
+        load_config(p)
+
+
+def test_non_string_description_rejected(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+description = 42
+""",
+    )
+    with pytest.raises(ValueError, match="description must be a string"):
+        load_config(p)
+
+
 def test_no_env_var_plain_url(tmp_path):
     p = write_toml(
         tmp_path,

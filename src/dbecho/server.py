@@ -131,7 +131,15 @@ def schema(database: str) -> str:
         database: Name of the database from config (use list_databases to see available).
     """
     mgr = _get_manager()
-    tables = mgr.get_schema(database)
+    try:
+        tables = mgr.get_schema(database)
+    except ValueError as e:
+        return f"Schema error: {e}"
+    except TimeoutError:
+        return "Schema error: query timeout exceeded"
+    except Exception:
+        logger.exception("Schema failed on %s", database)
+        return "Schema error: unexpected failure (check server logs)"
 
     if not tables:
         return f"No tables found in '{database}' (public schema)."
@@ -166,6 +174,8 @@ def query(database: str, sql: str) -> str:
         result = mgr.query(database, sql)
     except ValueError as e:
         return f"Query error: {e}"
+    except TimeoutError:
+        return "Query error: query timeout exceeded"
     except Exception:
         logger.exception("Query failed on %s", database)
         return "Query error: unexpected failure (check server logs)"
@@ -192,6 +202,8 @@ def analyze(database: str, table: str) -> str:
         stats = mgr.get_table_stats(database, table)
     except ValueError as e:
         return f"Analyze error: {e}"
+    except TimeoutError:
+        return "Analyze error: query timeout exceeded"
     except Exception:
         logger.exception("Analyze failed on %s.%s", database, table)
         return "Analyze error: unexpected failure (check server logs)"
@@ -247,6 +259,8 @@ def compare(sql: str, databases: list[str] | None = None) -> str:
             results[name] = result
         except ValueError as e:
             results[name] = str(e)
+        except TimeoutError:
+            results[name] = "query timeout exceeded"
         except Exception:
             logger.exception("Compare query failed on %s", name)
             results[name] = "unexpected failure (check server logs)"
@@ -317,6 +331,8 @@ def trend(
         result = mgr.get_trend(database, table, date_column, value_column, period)
     except ValueError as e:
         return f"Trend error: {e}"
+    except TimeoutError:
+        return "Trend error: query timeout exceeded"
     except Exception:
         logger.exception("Trend failed on %s.%s", database, table)
         return "Trend error: unexpected failure (check server logs)"
@@ -343,6 +359,8 @@ def anomalies(database: str, table: str) -> str:
         result = mgr.find_anomalies(database, table)
     except ValueError as e:
         return f"Anomalies error: {e}"
+    except TimeoutError:
+        return "Anomalies error: query timeout exceeded"
     except Exception:
         logger.exception("Anomalies failed on %s.%s", database, table)
         return "Anomalies error: unexpected failure (check server logs)"
@@ -378,6 +396,8 @@ def sample(database: str, table: str, limit: int = 5) -> str:
         result = mgr.get_sample(database, table, limit)
     except ValueError as e:
         return f"Sample error: {e}"
+    except TimeoutError:
+        return "Sample error: query timeout exceeded"
     except Exception:
         logger.exception("Sample failed on %s.%s", database, table)
         return "Sample error: unexpected failure (check server logs)"
@@ -393,8 +413,16 @@ def erd(database: str) -> str:
         database: Name of the database from config.
     """
     mgr = _get_manager()
-    tables = mgr.get_schema(database)
-    fks = mgr.get_foreign_keys(database)
+    try:
+        tables = mgr.get_schema(database)
+        fks = mgr.get_foreign_keys(database)
+    except ValueError as e:
+        return f"ERD error: {e}"
+    except TimeoutError:
+        return "ERD error: query timeout exceeded"
+    except Exception:
+        logger.exception("ERD failed on %s", database)
+        return "ERD error: unexpected failure (check server logs)"
 
     lines = [f"ERD for '{database}'\n"]
 

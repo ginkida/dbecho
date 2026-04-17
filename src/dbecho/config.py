@@ -43,6 +43,7 @@ class Config:
 
 
 _SETTINGS_FIELDS = {f.name for f in Settings.__dataclass_fields__.values()}
+_DATABASE_FIELDS = {"url", "description"}
 
 
 def _expand_env(value: str) -> str:
@@ -82,6 +83,11 @@ def load_config(path: Path) -> Config:
     for name, db_data in raw_databases.items():
         if not isinstance(db_data, dict):
             raise ValueError(f"[databases.{name}] must be a table")
+        unknown = set(db_data) - _DATABASE_FIELDS
+        if unknown:
+            raise ValueError(
+                f"[databases.{name}] has unknown keys: {', '.join(sorted(unknown))}"
+            )
         if "url" not in db_data:
             raise ValueError(f"[databases.{name}] missing required 'url' field")
         url = db_data["url"]
@@ -92,11 +98,14 @@ def load_config(path: Path) -> Config:
             raise ValueError(
                 f"[databases.{name}].url is empty after environment variable expansion"
             )
+        description = db_data.get("description", "")
+        if not isinstance(description, str):
+            raise ValueError(f"[databases.{name}].description must be a string")
         databases.append(
             DatabaseConfig(
                 name=name,
                 url=url,
-                description=db_data.get("description", ""),
+                description=description,
             )
         )
 
