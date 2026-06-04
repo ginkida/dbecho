@@ -8,5 +8,13 @@ description = "Main application"
 # description = "Production database"
 
 [settings]
-row_limit = 500
-query_timeout = 30
+row_limit = 500          # max rows returned per query (default: 500)
+query_timeout = 30       # seconds before a query is killed (default: 30)
+
+# Tables with more rows than this are refused by analyze/anomalies
+# (full-table profiling); use targeted queries instead. Default: 5_000_000.
+# max_profile_rows = 5000000
+
+# Replace values of sensitive-looking columns (password/token/secret/...)
+# with "<redacted>" in query/sample/analyze output. Default: true.
+# redact_sensitive = true

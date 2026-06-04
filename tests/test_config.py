@@ -231,3 +231,113 @@ url = "postgres://localhost/plain"
     )
     config = load_config(p)
     assert config.databases[0].url == "postgres://localhost/plain"
+
+
+def test_env_var_whitespace_stripped(tmp_path, monkeypatch):
+    monkeypatch.setenv("SPACED_URL", "postgres://localhost/spaced")
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "${ SPACED_URL }"
+""",
+    )
+    config = load_config(p)
+    assert config.databases[0].url == "postgres://localhost/spaced"
+
+
+def test_empty_env_placeholder_rejected(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "${ }"
+""",
+    )
+    with pytest.raises(ValueError, match="Empty"):
+        load_config(p)
+
+
+def test_row_limit_upper_bound(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+
+[settings]
+row_limit = 100000000
+""",
+    )
+    with pytest.raises(ValueError, match="row_limit must not exceed"):
+        load_config(p)
+
+
+def test_query_timeout_upper_bound(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+
+[settings]
+query_timeout = 7200
+""",
+    )
+    with pytest.raises(ValueError, match="query_timeout must not exceed"):
+        load_config(p)
+
+
+def test_max_profile_rows_setting(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+
+[settings]
+max_profile_rows = 1000
+""",
+    )
+    config = load_config(p)
+    assert config.settings.max_profile_rows == 1000
+
+
+def test_redact_sensitive_defaults_to_true(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+""",
+    )
+    assert load_config(p).settings.redact_sensitive is True
+
+
+def test_redact_sensitive_can_be_disabled(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+
+[settings]
+redact_sensitive = false
+""",
+    )
+    assert load_config(p).settings.redact_sensitive is False
+
+
+def test_redact_sensitive_non_bool_rejected(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+
+[settings]
+redact_sensitive = 1
+""",
+    )
+    with pytest.raises(ValueError, match="must be a boolean"):
+        load_config(p)

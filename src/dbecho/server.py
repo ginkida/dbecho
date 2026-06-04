@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from pathlib import Path
@@ -11,13 +12,21 @@ from dbecho.db import DatabaseManager
 
 logger = logging.getLogger("dbecho")
 
+# Cap stringification of individual cells well before the 60-char display
+# truncation so a multi-MB text/jsonb cell never gets fully measured/padded.
+_MAX_CELL_CHARS = 200
+# Generous cap on the compare() fan-out so a repeated/attacker-supplied list
+# cannot multiply an expensive query arbitrarily.
+_MAX_COMPARE_DBS = 20
+
 mcp = FastMCP(
     "dbecho",
     instructions=(
         "dbecho is a multi-database PostgreSQL analytics server. "
         "Start with list_databases or summary to see available databases. "
-        "Use schema to explore structure, query for SQL, analyze to profile tables, "
-        "compare to cross-reference databases, trend for time series, "
+        "Use schema to explore structure (describe for a single table), "
+        "query for SQL (explain to preview cost first), analyze to profile "
+        "tables, compare to cross-reference databases, trend for time series, "
         "anomalies to find data issues, sample to preview rows, "
         "erd to see relationships, and health to check connectivity."
     ),
@@ -57,6 +66,28 @@ def _get_manager() -> DatabaseManager:
     return _manager
 
 
+def _format_cell(v) -> str:
+    if v is None:
+        return "NULL"
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return f"<{len(bytes(v))} bytes>"
+    if isinstance(v, (dict, list)):
+        s = json.dumps(v, ensure_ascii=False, default=str)
+    else:
+        s = str(v)
+    if len(s) > _MAX_CELL_CHARS:
+        s = s[: _MAX_CELL_CHARS - 1] + "…"
+    return s
+
+
+def _fit(value: str, width: int) -> str:
+    """Pad to width; mark truncation with an ellipsis instead of a silent cut
+    so the agent never mistakes a clipped value for the complete one."""
+    if len(value) > width:
+        return value[: width - 1] + "…"
+    return value.ljust(width)
+
+
 def _format_table(columns: list[str], rows: list[list]) -> str:
     if not columns:
         return "(no columns)"
@@ -67,20 +98,35 @@ def _format_table(columns: list[str], rows: list[list]) -> str:
     str_rows = []
     for row in rows:
         padded = list(row) + [None] * (ncols - len(row))
-        str_rows.append([str(v) if v is not None else "NULL" for v in padded[:ncols]])
+        str_rows.append([_format_cell(v) for v in padded[:ncols]])
 
     widths = [
         min(max(len(columns[i]), *(len(r[i]) for r in str_rows)), 60)
         for i in range(ncols)
     ]
 
-    header = " | ".join(c.ljust(w)[:w] for c, w in zip(columns, widths))
+    header = " | ".join(_fit(c, w) for c, w in zip(columns, widths))
     separator = "-+-".join("-" * w for w in widths)
     body = "\n".join(
-        " | ".join(v.ljust(w)[:w] for v, w in zip(row, widths)) for row in str_rows
+        " | ".join(_fit(v, w) for v, w in zip(row, widths)) for row in str_rows
     )
 
     return f"{header}\n{separator}\n{body}"
+
+
+def _to_json(result) -> str:
+    """Machine-parseable form of a QueryResult; str() fallback covers
+    datetime/Decimal/UUID/bytes and anything else non-JSON-native."""
+    return json.dumps(
+        {
+            "columns": result.columns,
+            "rows": result.rows,
+            "row_count": result.row_count,
+            "truncated": result.truncated,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
 
 
 def _format_size(size_bytes: int | float) -> str:
@@ -127,6 +173,9 @@ def health() -> str:
 def schema(database: str) -> str:
     """Get the full schema of a database: tables, columns, types, primary keys, row counts, and sizes.
 
+    Row counts are PostgreSQL planner estimates (0 for never-analyzed tables);
+    use analyze or query for exact counts.
+
     Args:
         database: Name of the database from config (use list_databases to see available).
     """
@@ -135,8 +184,8 @@ def schema(database: str) -> str:
         tables = mgr.get_schema(database)
     except ValueError as e:
         return f"Schema error: {e}"
-    except TimeoutError:
-        return "Schema error: query timeout exceeded"
+    except TimeoutError as e:
+        return f"Schema error: {e}"
     except Exception:
         logger.exception("Schema failed on %s", database)
         return "Schema error: unexpected failure (check server logs)"
@@ -148,7 +197,7 @@ def schema(database: str) -> str:
     for t in tables:
         comment = f"  -- {t.comment}" if t.comment else ""
         size = _format_size(t.size_bytes)
-        lines.append(f"## {t.name} ({t.row_count:,} rows, {size}){comment}")
+        lines.append(f"## {t.name} (~{t.row_count:,} rows est., {size}){comment}")
         for col in t.columns:
             pk = " [PK]" if col.is_primary_key else ""
             nullable = "NULL" if col.nullable else "NOT NULL"
@@ -156,37 +205,121 @@ def schema(database: str) -> str:
             lines.append(f"  {col.name}: {col.data_type} {nullable}{default}{pk}")
         lines.append("")
 
+    if mgr.schema_truncated(database):
+        lines.append("(table list truncated — database exceeds the schema cap)")
+
     return "\n".join(lines)
 
 
 @mcp.tool()
-def query(database: str, sql: str) -> str:
-    """Execute a read-only SQL query on a database and return results as a formatted table.
+def query(database: str, sql: str, offset: int = 0, format: str = "table") -> str:
+    """Execute a read-only SQL query on a database and return the results.
 
     Only SELECT, WITH, EXPLAIN, and SHOW queries are allowed.
 
     Args:
         database: Name of the database from config.
         sql: SQL query to execute (read-only).
+        offset: Rows to skip before collecting results — use to page through
+            truncated results (stable only with ORDER BY).
+        format: "table" (default, ASCII table) or "json" ({columns, rows,
+            row_count, truncated}).
     """
+    if format not in ("table", "json"):
+        return f"Query error: unknown format '{format}'. Use: table, json"
     mgr = _get_manager()
     try:
-        result = mgr.query(database, sql)
+        result = mgr.query(database, sql, offset=offset)
     except ValueError as e:
         return f"Query error: {e}"
-    except TimeoutError:
-        return "Query error: query timeout exceeded"
+    except TimeoutError as e:
+        return f"Query error: {e}"
     except Exception:
         logger.exception("Query failed on %s", database)
         return "Query error: unexpected failure (check server logs)"
 
+    if format == "json":
+        return _to_json(result)
+
     output = _format_table(result.columns, result.rows)
     suffix = (
-        f"(truncated to {result.row_count} rows)"
+        f"(truncated to {result.row_count} rows — pass offset={offset + result.row_count} for more)"
         if result.truncated
         else f"({result.row_count} rows)"
     )
     return f"{output}\n\n{suffix}"
+
+
+@mcp.tool()
+def describe(database: str, table: str) -> str:
+    """Describe a single table: columns, types, primary key, indexes, row estimate, size.
+
+    Much cheaper than schema when you only need one table.
+
+    Args:
+        database: Name of the database from config.
+        table: Name of the table to describe.
+    """
+    mgr = _get_manager()
+    try:
+        info = mgr.get_table_schema(database, table)
+        indexes = mgr.get_indexes(database, table)
+    except ValueError as e:
+        return f"Describe error: {e}"
+    except TimeoutError as e:
+        return f"Describe error: {e}"
+    except Exception:
+        logger.exception("Describe failed on %s.%s", database, table)
+        return "Describe error: unexpected failure (check server logs)"
+
+    comment = f"  -- {info.comment}" if info.comment else ""
+    size = _format_size(info.size_bytes)
+    lines = [f"## {info.name} (~{info.row_count:,} rows est., {size}){comment}"]
+    for col in info.columns:
+        pk = " [PK]" if col.is_primary_key else ""
+        nullable = "NULL" if col.nullable else "NOT NULL"
+        default = f" DEFAULT {col.default}" if col.default else ""
+        lines.append(f"  {col.name}: {col.data_type} {nullable}{default}{pk}")
+
+    if indexes:
+        lines.append("\nIndexes:")
+        for ix in indexes:
+            unique = " UNIQUE" if ix["unique"] else ""
+            lines.append(f"  {ix['name']}{unique} ({ix['columns']})")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def explain(database: str, sql: str) -> str:
+    """Show the query plan with estimated cost and row count WITHOUT executing the query.
+
+    Use before running a potentially expensive query to judge whether it fits
+    the timeout. Only SELECT and WITH queries can be explained.
+
+    Args:
+        database: Name of the database from config.
+        sql: SELECT/WITH query to plan (not executed).
+    """
+    mgr = _get_manager()
+    try:
+        plan = mgr.explain(database, sql)
+    except ValueError as e:
+        return f"Explain error: {e}"
+    except TimeoutError as e:
+        return f"Explain error: {e}"
+    except Exception:
+        logger.exception("Explain failed on %s", database)
+        return "Explain error: unexpected failure (check server logs)"
+
+    lines = [
+        f"Node: {plan['node_type']}",
+        f"Estimated total cost: {plan['total_cost']}",
+        f"Estimated rows: {plan['estimated_rows']}",
+        "",
+        json.dumps(plan["plan"], ensure_ascii=False, default=str, indent=2),
+    ]
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -202,8 +335,8 @@ def analyze(database: str, table: str) -> str:
         stats = mgr.get_table_stats(database, table)
     except ValueError as e:
         return f"Analyze error: {e}"
-    except TimeoutError:
-        return "Analyze error: query timeout exceeded"
+    except TimeoutError as e:
+        return f"Analyze error: {e}"
     except Exception:
         logger.exception("Analyze failed on %s.%s", database, table)
         return "Analyze error: unexpected failure (check server logs)"
@@ -226,11 +359,18 @@ def analyze(database: str, table: str) -> str:
 
         if "top_values" in col:
             top = ", ".join(
-                f"{v['value']}({v['count']})" for v in col["top_values"][:5]
+                f"{v['value']}({v['count']}, {v['pct']}%)"
+                for v in col["top_values"][:5]
             )
             parts.append(f"    top: {top}")
 
         lines.append("\n".join(parts))
+
+    if stats.get("skipped_columns"):
+        lines.append(
+            f"\n(skipped columns after failed probes: "
+            f"{', '.join(stats['skipped_columns'])})"
+        )
 
     return "\n".join(lines)
 
@@ -241,7 +381,8 @@ def compare(sql: str, databases: list[str] | None = None) -> str:
 
     Args:
         sql: SQL query to execute on each database (must be SELECT).
-        databases: List of database names to compare. If omitted, runs on all databases.
+        databases: List of database names to compare. If omitted, runs on all
+            databases (capped at 20 per call).
     """
     mgr = _get_manager()
 
@@ -250,7 +391,10 @@ def compare(sql: str, databases: list[str] | None = None) -> str:
     except ValueError as e:
         return f"Query error: {e}"
 
-    db_names = databases or mgr.database_names
+    # Dedup (repeats add nothing) and cap so the list cannot multiply an
+    # expensive query's cost arbitrarily.
+    all_names = list(dict.fromkeys(databases or mgr.database_names))
+    db_names = all_names[:_MAX_COMPARE_DBS]
 
     results = {}
     for name in db_names:
@@ -259,8 +403,8 @@ def compare(sql: str, databases: list[str] | None = None) -> str:
             results[name] = result
         except ValueError as e:
             results[name] = str(e)
-        except TimeoutError:
-            results[name] = "query timeout exceeded"
+        except TimeoutError as e:
+            results[name] = str(e)
         except Exception:
             logger.exception("Compare query failed on %s", name)
             results[name] = "unexpected failure (check server logs)"
@@ -275,12 +419,18 @@ def compare(sql: str, databases: list[str] | None = None) -> str:
             lines.append(f"({result.row_count} rows)")
         lines.append("")
 
+    if len(all_names) > _MAX_COMPARE_DBS:
+        lines.append(
+            f"Note: compared the first {_MAX_COMPARE_DBS} of {len(all_names)} "
+            f"databases (cap). Pass an explicit databases=[...] subset for the rest."
+        )
+
     return "\n".join(lines)
 
 
 @mcp.tool()
 def summary() -> str:
-    """Get a quick overview of all databases: table counts, total rows, largest tables, database sizes."""
+    """Get a quick overview of all databases: table counts, total rows (planner estimates), largest tables, database sizes."""
     mgr = _get_manager()
 
     lines = []
@@ -291,19 +441,26 @@ def summary() -> str:
             total_rows = sum(t.row_count for t in tables)
             total_size = sum(t.size_bytes for t in tables)
             sorted_tables = sorted(tables, key=lambda t: t.row_count, reverse=True)
-            top3 = ", ".join(f"{t.name}({t.row_count:,})" for t in sorted_tables[:3])
+            top3 = ", ".join(f"{t.name}(~{t.row_count:,})" for t in sorted_tables[:3])
 
             desc = f" -- {db.description}" if db.description else ""
             lines.append(f"## {name}{desc}")
             lines.append(f"  Tables: {len(tables)}")
-            lines.append(f"  Total rows: {total_rows:,}")
+            lines.append(f"  Total rows: ~{total_rows:,} (est.)")
             lines.append(f"  Total size: {_format_size(total_size)}")
             if top3:
                 lines.append(f"  Largest: {top3}")
             lines.append("")
-        except Exception as e:
+        except ValueError as e:
             lines.append(f"## {name}")
             lines.append(f"  Error: {e}")
+            lines.append("")
+        except Exception:
+            # Raw exceptions can embed connection details — log for the
+            # operator, keep the agent-visible message generic.
+            logger.exception("Summary failed on %s", name)
+            lines.append(f"## {name}")
+            lines.append("  Error: unavailable (check server logs)")
             lines.append("")
 
     return "\n".join(lines) if lines else "No databases configured."
@@ -331,8 +488,8 @@ def trend(
         result = mgr.get_trend(database, table, date_column, value_column, period)
     except ValueError as e:
         return f"Trend error: {e}"
-    except TimeoutError:
-        return "Trend error: query timeout exceeded"
+    except TimeoutError as e:
+        return f"Trend error: {e}"
     except Exception:
         logger.exception("Trend failed on %s.%s", database, table)
         return "Trend error: unexpected failure (check server logs)"
@@ -359,8 +516,8 @@ def anomalies(database: str, table: str) -> str:
         result = mgr.find_anomalies(database, table)
     except ValueError as e:
         return f"Anomalies error: {e}"
-    except TimeoutError:
-        return "Anomalies error: query timeout exceeded"
+    except TimeoutError as e:
+        return f"Anomalies error: {e}"
     except Exception:
         logger.exception("Anomalies failed on %s.%s", database, table)
         return "Anomalies error: unexpected failure (check server logs)"
@@ -377,6 +534,12 @@ def anomalies(database: str, table: str) -> str:
         lines.append(f"Found {len(result['anomalies'])} issue(s):\n")
         for a in result["anomalies"]:
             lines.append(f"  [{a['type']}] {a['column']}: {a['detail']}")
+
+    if result.get("skipped_columns"):
+        lines.append(
+            f"\n(skipped columns after failed probes: "
+            f"{', '.join(result['skipped_columns'])})"
+        )
 
     return "\n".join(lines)
 
@@ -396,8 +559,8 @@ def sample(database: str, table: str, limit: int = 5) -> str:
         result = mgr.get_sample(database, table, limit)
     except ValueError as e:
         return f"Sample error: {e}"
-    except TimeoutError:
-        return "Sample error: query timeout exceeded"
+    except TimeoutError as e:
+        return f"Sample error: {e}"
     except Exception:
         logger.exception("Sample failed on %s.%s", database, table)
         return "Sample error: unexpected failure (check server logs)"
@@ -418,8 +581,8 @@ def erd(database: str) -> str:
         fks = mgr.get_foreign_keys(database)
     except ValueError as e:
         return f"ERD error: {e}"
-    except TimeoutError:
-        return "ERD error: query timeout exceeded"
+    except TimeoutError as e:
+        return f"ERD error: {e}"
     except Exception:
         logger.exception("ERD failed on %s", database)
         return "ERD error: unexpected failure (check server logs)"
@@ -429,7 +592,7 @@ def erd(database: str) -> str:
     for t in tables:
         pk_cols = [c.name for c in t.columns if c.is_primary_key]
         pk_str = f" (PK: {', '.join(pk_cols)})" if pk_cols else ""
-        lines.append(f"[{t.name}]{pk_str} -- {t.row_count:,} rows")
+        lines.append(f"[{t.name}]{pk_str} -- ~{t.row_count:,} rows (est.)")
 
     if fks:
         lines.append("\nRelationships:")
@@ -453,8 +616,10 @@ def resource_databases() -> str:
     """List of all configured databases."""
     try:
         return list_databases()
-    except Exception as e:
-        return f"Error loading databases: {e}"
+    except Exception:
+        # Config errors can embed env var names and paths — log, stay generic.
+        logger.exception("Resource databases failed")
+        return "Error loading databases (check server logs)"
 
 
 @mcp.resource("dbecho://databases/{database}/schema")
@@ -462,8 +627,11 @@ def resource_schema(database: str) -> str:
     """Schema for a specific database."""
     try:
         return schema(database)
-    except Exception as e:
+    except ValueError as e:
         return f"Error loading schema for '{database}': {e}"
+    except Exception:
+        logger.exception("Resource schema failed on %s", database)
+        return f"Error loading schema for '{database}' (check server logs)"
 
 
 @mcp.resource("dbecho://databases/{database}/summary")
@@ -475,12 +643,15 @@ def resource_summary(database: str) -> str:
         total_rows = sum(t.row_count for t in tables)
         total_size = sum(t.size_bytes for t in tables)
         table_list = "\n".join(
-            f"  - {t.name}: {t.row_count:,} rows, {_format_size(t.size_bytes)}"
+            f"  - {t.name}: ~{t.row_count:,} rows (est.), {_format_size(t.size_bytes)}"
             for t in tables
         )
-        return f"Database: {database}\nTables: {len(tables)}\nTotal rows: {total_rows:,}\nTotal size: {_format_size(total_size)}\n\n{table_list}"
-    except Exception as e:
+        return f"Database: {database}\nTables: {len(tables)}\nTotal rows: ~{total_rows:,} (est.)\nTotal size: {_format_size(total_size)}\n\n{table_list}"
+    except ValueError as e:
         return f"Error loading summary for '{database}': {e}"
+    except Exception:
+        logger.exception("Resource summary failed on %s", database)
+        return f"Error loading summary for '{database}' (check server logs)"
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +701,19 @@ def data_quality_report(database: str) -> str:
 
 
 def main():
+    # stdio MCP uses stdout for the JSON-RPC protocol — force all logging to
+    # stderr regardless of what any imported library configured first.
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
+
+    # Validate config eagerly so a broken config (missing file, unset ${VAR},
+    # malformed TOML) fails loudly at launch for the operator instead of
+    # surfacing mid-session on the first tool call. No DB I/O happens here.
+    try:
+        _get_manager()
+    except Exception as e:
+        logger.error("Startup failed: %s", e)
+        raise SystemExit(1)
+
     mcp.run()
 
 

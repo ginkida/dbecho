@@ -12,6 +12,13 @@ from pathlib import Path
 
 _ENV_VAR_RE = re.compile(r"\$\{([^}]+)\}")
 
+# Upper bounds are intentional safety guards: row_limit caps client-side fetch
+# size, so an operator typo (e.g. row_limit = 100000000) must not silently turn
+# every query into a multi-GB pull that can OOM the stdio server.
+_MAX_ROW_LIMIT = 1_000_000
+_MAX_QUERY_TIMEOUT = 3600  # seconds
+_MAX_PROFILE_ROWS = 1_000_000_000
+
 
 @dataclass
 class DatabaseConfig:
@@ -24,16 +31,32 @@ class DatabaseConfig:
 class Settings:
     row_limit: int = 500
     query_timeout: int = 30
+    # Tables above this row count are refused by the full-table profilers
+    # (analyze/anomalies) so a single tool call cannot pin the DB scanning
+    # every column. Targeted queries are still available via `query`.
+    max_profile_rows: int = 5_000_000
+    # Replace values of obviously-sensitive columns (password/token/secret/...)
+    # with "<redacted>" in sample/analyze/query output. Harm reduction, not a
+    # hermetic control — see README.
+    redact_sensitive: bool = True
 
     def __post_init__(self) -> None:
-        for field_name, value in (
-            ("row_limit", self.row_limit),
-            ("query_timeout", self.query_timeout),
+        for field_name, upper in (
+            ("row_limit", _MAX_ROW_LIMIT),
+            ("query_timeout", _MAX_QUERY_TIMEOUT),
+            ("max_profile_rows", _MAX_PROFILE_ROWS),
         ):
+            value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int):
                 raise ValueError(f"[settings].{field_name} must be an integer")
             if value <= 0:
                 raise ValueError(f"[settings].{field_name} must be greater than 0")
+            if value > upper:
+                raise ValueError(
+                    f"[settings].{field_name} must not exceed {upper:,} (safety guard)"
+                )
+        if not isinstance(self.redact_sensitive, bool):
+            raise ValueError("[settings].redact_sensitive must be a boolean")
 
 
 @dataclass
@@ -50,7 +73,9 @@ def _expand_env(value: str) -> str:
     """Replace ${VAR} placeholders with environment variable values."""
 
     def _replace(match: re.Match) -> str:
-        var = match.group(1)
+        var = match.group(1).strip()
+        if not var:
+            raise ValueError("Empty ${} placeholder in URL")
         result = os.environ.get(var)
         if result is None:
             raise ValueError(f"Environment variable '{var}' is not set")

@@ -20,14 +20,16 @@ Claude: [runs schema → query → analyze → trend across 29 tables]
 
 ## What can it do?
 
-**11 tools** that cover the full analytics workflow:
+**13 tools** that cover the full analytics workflow:
 
 | Tool | Purpose |
 |------|---------|
 | `list_databases` | Show all connected databases |
 | `health` | Check connectivity, PostgreSQL version, database size |
 | `schema` | Full schema: tables, columns, types, PKs, row counts, sizes |
-| `query` | Run read-only SQL (SELECT, WITH, EXPLAIN, SHOW) |
+| `describe` | One table in depth: columns, PK, indexes, size — cheaper than `schema` |
+| `query` | Run read-only SQL (SELECT, WITH, EXPLAIN, SHOW), with offset paging and JSON output |
+| `explain` | Query plan with estimated cost/rows — judge a query before running it |
 | `analyze` | Profile a table: nulls, cardinality, distributions, top values |
 | `compare` | Same query across multiple databases, side by side |
 | `summary` | Overview: table counts, total rows, largest tables |
@@ -122,8 +124,10 @@ url = "postgres://user:pass@localhost:5432/analytics"
 description = "Analytics warehouse"
 
 [settings]
-row_limit = 500       # max rows returned per query (default: 500)
-query_timeout = 30    # seconds before query is killed (default: 30)
+row_limit = 500           # max rows returned per query (default: 500)
+query_timeout = 30        # seconds before query is killed (default: 30)
+max_profile_rows = 5000000  # refuse analyze/anomalies above this row count
+redact_sensitive = true   # redact password/token/secret-like columns in output
 ```
 
 Environment variables work with `${VAR}` syntax:
@@ -191,11 +195,16 @@ The agent picks the right tools automatically. You don't need to know the tool n
 dbecho is designed to be safe to point at any database, including production:
 
 - **Read-only connections.** Every connection sets `default_transaction_read_only=on` at the PostgreSQL level. Even if someone crafts malicious SQL, the database rejects writes.
-- **Query whitelist.** Only `SELECT`, `WITH`, `EXPLAIN`, and `SHOW` statements are allowed. Checked before execution.
+- **Query whitelist.** Only `SELECT`, `WITH`, `EXPLAIN`, and `SHOW` statements are allowed — and the validator independently rejects data-modifying CTEs (`WITH x AS (DELETE ...) SELECT ...`), `SELECT INTO`, and `EXPLAIN ANALYZE` over write statements, so it doesn't rely on the read-only connection alone.
+- **Blocked functions.** Filesystem, large-object, `dblink`, and `set_config` functions are rejected even though the transaction is read-only — they are exfiltration/escape vectors.
 - **SQL injection prevention.** All table/column identifiers use `psycopg.sql.Identifier()` parameterization. User input is validated against `^[a-zA-Z_][a-zA-Z0-9_]*$`.
-- **Query timeout.** Default 30 seconds. Prevents runaway queries from locking your database.
-- **Row limit.** Default 500 rows per query. Prevents the agent from pulling entire tables into context.
+- **Query timeout.** Default 30 seconds, enforced as one shared budget across multi-query tools via `statement_timeout`, with session-level timeout backstops on every connection.
+- **Row limit.** Default 500 rows per query. Prevents the agent from pulling entire tables into context. Full-table profiling (`analyze`/`anomalies`) additionally refuses tables above `max_profile_rows`.
+- **Sensitive-column redaction.** Values of columns that look like secrets (`password`, `token`, `api_key`, `secret`, ...) are replaced with `<redacted>` in `query`/`sample`/`analyze` output (default on; `redact_sensitive = false` to disable). This is name-based harm reduction, **not** a hermetic control — `query` is an open read channel by design.
+- **Sanitized errors.** Connection failures are reported to the agent as coarse categories (`authentication failed`, `connection refused`, ...); full details go to the server log only, so hostnames/usernames never leak into the conversation.
 - **Local only.** No network calls, no telemetry, no cloud. Data stays on your machine.
+
+For production databases, the strongest setup is still a **least-privilege role**: a PostgreSQL user with `SELECT` only on the tables/views you want exposed. dbecho's layers protect against accidents and prompt-injected agents; the database's own grants are the final word.
 
 ## Architecture
 
@@ -203,10 +212,10 @@ dbecho is designed to be safe to point at any database, including production:
 src/dbecho/
   config.py   TOML config loading, env var expansion, validation
   db.py       DatabaseManager: connections, schema cache, queries, stats, trends, anomalies
-  server.py   FastMCP server: 11 tools, 3 resources, 3 prompts
+  server.py   FastMCP server: 13 tools, 3 resources, 3 prompts
 ```
 
-~1000 lines of Python total. No framework beyond `mcp` and `psycopg`.
+~2000 lines of Python total. No framework beyond `mcp` and `psycopg`.
 
 ## Development
 
