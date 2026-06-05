@@ -2,6 +2,8 @@ import pytest
 from unittest.mock import patch, MagicMock
 from contextlib import contextmanager
 
+from psycopg.sql import SQL, Identifier
+
 from dbecho.db import (
     DatabaseManager,
     _SAFE_TABLE_RE,
@@ -11,9 +13,11 @@ from dbecho.db import (
 from dbecho.config import Config, DatabaseConfig, Settings
 
 
-def make_manager(**kwargs) -> DatabaseManager:
+def make_manager(schema: str = "public", **kwargs) -> DatabaseManager:
     config = Config(
-        databases=[DatabaseConfig(name="test", url="postgres://localhost/test")],
+        databases=[
+            DatabaseConfig(name="test", url="postgres://localhost/test", schema=schema)
+        ],
         settings=Settings(**kwargs),
     )
     return DatabaseManager(config)
@@ -942,6 +946,199 @@ class TestConnectionOptions:
                     raise RuntimeError("boom")
 
         fake_conn.close.assert_called_once()
+
+
+class TestSchemaScoping:
+    def test_search_path_set_for_non_public_schema(self):
+        mgr = make_manager(schema="analytics")
+        db = mgr.get_database("test")
+        fake_conn = MagicMock()
+
+        with patch("dbecho.db.psycopg.connect", return_value=fake_conn) as mock_conn:
+            with mgr._connect(db):
+                pass
+
+        options = mock_conn.call_args.kwargs["options"]
+        assert "-c search_path=analytics,public" in options
+
+    def test_search_path_not_set_for_public_schema(self):
+        mgr = make_manager()
+        db = mgr.get_database("test")
+        fake_conn = MagicMock()
+
+        with patch("dbecho.db.psycopg.connect", return_value=fake_conn) as mock_conn:
+            with mgr._connect(db):
+                pass
+
+        assert "search_path" not in mock_conn.call_args.kwargs["options"]
+
+    def test_sample_qualifies_table_with_schema(self):
+        cur = MagicMock()
+        cur.description = [("id",)]
+        cur.fetchone = MagicMock(return_value=(1,))
+        cur.fetchall = MagicMock(return_value=[])
+
+        with mock_connection(cur):
+            mgr = make_manager(schema="analytics")
+            mgr.get_sample("test", "events", 5)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        assert (
+            SQL("SELECT * FROM {} LIMIT %s").format(Identifier("analytics", "events"))
+            in executed
+        )
+
+    def test_table_existence_check_uses_schema(self):
+        cur = MagicMock()
+        cur.description = [("id",)]
+        cur.fetchone = MagicMock(return_value=(1,))
+        cur.fetchall = MagicMock(return_value=[])
+
+        with mock_connection(cur):
+            mgr = make_manager(schema="analytics")
+            mgr.get_sample("test", "events", 5)
+
+        checks = [
+            c
+            for c in cur.execute.call_args_list
+            if isinstance(c.args[0], str) and "pg_tables" in c.args[0]
+        ]
+        assert checks and checks[0].args[1] == ("analytics", "events")
+
+    def test_table_not_found_mentions_schema(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(side_effect=[(0,)])
+
+        with mock_connection(cur):
+            mgr = make_manager(schema="analytics")
+            with pytest.raises(ValueError, match="schema 'analytics'"):
+                mgr.get_table_stats("test", "missing")
+
+    @staticmethod
+    def _assert_no_hardcoded_public(cur):
+        # Kills "param passed but SQL still hardcodes 'public'" mutants: a
+        # query that gained a schema parameter must not keep the literal too.
+        assert not any(
+            "'public'" in c.args[0]
+            for c in cur.execute.call_args_list
+            if isinstance(c.args[0], str)
+        )
+
+    def test_get_schema_filters_by_configured_schema(self):
+        cur, _ = make_mock_cursor([[], [], []])
+
+        with mock_connection(cur):
+            mgr = make_manager(schema="analytics")
+            assert mgr.get_schema("test") == []
+
+        tables_query = [
+            c
+            for c in cur.execute.call_args_list
+            if isinstance(c.args[0], str) and "information_schema.tables" in c.args[0]
+        ]
+        assert tables_query and tables_query[0].args[1][0] == "analytics"
+        self._assert_no_hardcoded_public(cur)
+
+    def test_foreign_keys_filter_by_schema(self):
+        cur = MagicMock()
+        cur.fetchall = MagicMock(return_value=[])
+
+        with mock_connection(cur):
+            mgr = make_manager(schema="analytics")
+            assert mgr.get_foreign_keys("test") == []
+
+        fk_query = [
+            c
+            for c in cur.execute.call_args_list
+            if isinstance(c.args[0], str) and "pg_constraint" in c.args[0]
+        ]
+        assert fk_query and fk_query[0].args[1][:2] == ("analytics", "analytics")
+        self._assert_no_hardcoded_public(cur)
+
+    def test_indexes_filter_by_schema(self):
+        cur = MagicMock()
+        cur.fetchall = MagicMock(return_value=[])
+
+        with mock_connection(cur):
+            mgr = make_manager(schema="analytics")
+            assert mgr.get_indexes("test") == []
+
+        idx_query = [
+            c
+            for c in cur.execute.call_args_list
+            if isinstance(c.args[0], str) and "pg_index" in c.args[0]
+        ]
+        assert idx_query and idx_query[0].args[1][0] == "analytics"
+        self._assert_no_hardcoded_public(cur)
+
+    def test_trend_qualifies_table_with_schema(self):
+        cur = MagicMock()
+        cur.description = [("period",), ("count",)]
+        cur.fetchone = MagicMock(return_value=(1,))
+        cur.fetchall = MagicMock(
+            return_value=[("created_at", "timestamp with time zone")]
+        )
+        cur.fetchmany = MagicMock(return_value=[])
+
+        with mock_connection(cur):
+            mgr = make_manager(schema="analytics")
+            mgr.get_trend("test", "events", "created_at")
+
+        assert any(
+            "Identifier('analytics', 'events')" in repr(c.args[0])
+            for c in cur.execute.call_args_list
+        )
+        self._assert_no_hardcoded_public(cur)
+
+    def test_anomalies_qualifies_table_with_schema(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(side_effect=[(1,), (5,)])
+        cur.fetchall = MagicMock(return_value=[])
+
+        with mock_connection(cur):
+            mgr = make_manager(schema="analytics")
+            result = mgr.find_anomalies("test", "events")
+
+        assert result["anomalies"] == []
+        assert any(
+            "Identifier('analytics', 'events')" in repr(c.args[0])
+            for c in cur.execute.call_args_list
+        )
+        self._assert_no_hardcoded_public(cur)
+
+    def test_table_stats_qualifies_table_with_schema(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(side_effect=[(1,), (5,)])
+        cur.fetchall = MagicMock(return_value=[])
+
+        with mock_connection(cur):
+            mgr = make_manager(schema="analytics")
+            stats = mgr.get_table_stats("test", "events")
+
+        assert stats["columns"] == {}
+        assert any(
+            "Identifier('analytics', 'events')" in repr(c.args[0])
+            for c in cur.execute.call_args_list
+        )
+        self._assert_no_hardcoded_public(cur)
+
+    def test_describe_filters_by_schema(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(side_effect=[(1,), (None, 0, 0)])
+        cur.fetchall = MagicMock(return_value=[])
+
+        with mock_connection(cur):
+            mgr = make_manager(schema="analytics")
+            info = mgr.get_table_schema("test", "events")
+
+        assert info.columns == []
+        meta_calls = [
+            c
+            for c in cur.execute.call_args_list
+            if isinstance(c.args[0], str) and "information_schema" in c.args[0]
+        ]
+        assert meta_calls and all(c.args[1][0] == "analytics" for c in meta_calls)
+        self._assert_no_hardcoded_public(cur)
 
 
 class TestRedaction:

@@ -7,6 +7,13 @@ description = "Main application"
 # url = "${DATABASE_URL}"
 # description = "Production database"
 
+# Apps that keep tables outside public can set a schema (default: "public";
+# lowercase identifier). Metadata tools (schema/describe/analyze/...) target
+# it, and it leads search_path so raw queries can use unqualified table names:
+# [databases.events]
+# url = "postgres://localhost:5432/events"
+# schema = "analytics"
+
 [settings]
 row_limit = 500          # max rows returned per query (default: 500)
 query_timeout = 30       # seconds before a query is killed (default: 30)

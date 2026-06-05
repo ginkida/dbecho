@@ -138,6 +138,17 @@ url = "${DATABASE_URL}"
 description = "Production (read replica)"
 ```
 
+If an app keeps its tables outside `public`, set `schema` (default `"public"`,
+lowercase identifier). All metadata tools (`schema`, `describe`, `analyze`, ...)
+target it, and it leads `search_path` so raw queries can use unqualified table
+names:
+
+```toml
+[databases.events]
+url = "${EVENTS_DATABASE_URL}"
+schema = "analytics"
+```
+
 ### 3. Connect to your MCP client
 
 **Claude Code** (project-level, recommended):
@@ -197,7 +208,7 @@ dbecho is designed to be safe to point at any database, including production:
 - **Read-only connections.** Every connection sets `default_transaction_read_only=on` at the PostgreSQL level. Even if someone crafts malicious SQL, the database rejects writes.
 - **Query whitelist.** Only `SELECT`, `WITH`, `EXPLAIN`, and `SHOW` statements are allowed — and the validator independently rejects data-modifying CTEs (`WITH x AS (DELETE ...) SELECT ...`), `SELECT INTO`, and `EXPLAIN ANALYZE` over write statements, so it doesn't rely on the read-only connection alone.
 - **Blocked functions.** Filesystem, large-object, `dblink`, and `set_config` functions are rejected even though the transaction is read-only — they are exfiltration/escape vectors.
-- **SQL injection prevention.** All table/column identifiers use `psycopg.sql.Identifier()` parameterization. User input is validated against `^[a-zA-Z_][a-zA-Z0-9_]*$`.
+- **SQL injection prevention.** All table/column identifiers use `psycopg.sql.Identifier()` parameterization. User input is validated against `^[a-zA-Z_][a-zA-Z0-9_]*\Z` (`\Z`, not `$`, so a trailing newline can't sneak past). The one identifier-shaped value placed outside `Identifier()` is the per-database `schema` config option — it is embedded in the connection's `search_path` — and it is validated against the same shape (lowercase-only) at config load, before any connection exists.
 - **Query timeout.** Default 30 seconds, enforced as one shared budget across multi-query tools via `statement_timeout`, with session-level timeout backstops on every connection.
 - **Row limit.** Default 500 rows per query. Prevents the agent from pulling entire tables into context. Full-table profiling (`analyze`/`anomalies`) additionally refuses tables above `max_profile_rows`.
 - **Sensitive-column redaction.** Values of columns that look like secrets (`password`, `token`, `api_key`, `secret`, ...) are replaced with `<redacted>` in `query`/`sample`/`analyze` output (default on; `redact_sensitive = false` to disable). This is name-based harm reduction, **not** a hermetic control — `query` is an open read channel by design.

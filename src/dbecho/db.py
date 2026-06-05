@@ -400,6 +400,12 @@ class DatabaseManager:
             f" -c statement_timeout={timeout_ms}"
             f" -c idle_in_transaction_session_timeout={max(timeout_ms, 30000)}"
         )
+        # Non-public schema leads search_path so raw `query` SQL can use
+        # unqualified table names; public stays second for extensions
+        # (pgvector operators etc.). db.schema is validated as a plain
+        # identifier at config load, so embedding it here is safe.
+        if db.schema != "public":
+            options += f" -c search_path={db.schema},public"
         conn = psycopg.connect(
             db.url,
             options=options,
@@ -416,8 +422,8 @@ class DatabaseManager:
         return name
 
     @staticmethod
-    def _public_table(name: str) -> Identifier:
-        return Identifier("public", name)
+    def _qualified_table(db: DatabaseConfig, name: str) -> Identifier:
+        return Identifier(db.schema, name)
 
     def _new_deadline(self) -> float:
         return time.monotonic() + self._settings.query_timeout
@@ -464,22 +470,25 @@ class DatabaseManager:
         else:
             cur.execute(query, params)
 
-    def _ensure_public_table_exists(
+    def _ensure_table_exists(
         self,
         cur,
-        database: str,
+        db: DatabaseConfig,
         table: str,
         *,
         deadline: float,
     ) -> None:
         self._execute(
             cur,
-            "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public' AND tablename = %s",
-            (table,),
+            "SELECT COUNT(*) FROM pg_tables WHERE schemaname = %s AND tablename = %s",
+            (db.schema, table),
             deadline=deadline,
         )
         if cur.fetchone()[0] == 0:
-            raise ValueError(f"Table '{table}' not found in database '{database}'")
+            raise ValueError(
+                f"Table '{table}' not found in database '{db.name}' "
+                f"(schema '{db.schema}')"
+            )
 
     def check_connection(self, database: str) -> dict:
         db = self.get_database(database)
@@ -617,11 +626,11 @@ class DatabaseManager:
                         COALESCE(pg_total_relation_size((quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass), 0) AS size_bytes
                     FROM information_schema.tables t
                     LEFT JOIN pg_stat_user_tables s ON s.relname = t.table_name AND s.schemaname = t.table_schema
-                    WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+                    WHERE t.table_schema = %s AND t.table_type = 'BASE TABLE'
                     ORDER BY t.table_name
                     LIMIT %s
                 """,
-                    (_MAX_SCHEMA_TABLES + 1,),
+                    (db.schema, _MAX_SCHEMA_TABLES + 1),
                     deadline=deadline,
                 )
                 table_rows = cur.fetchall()
@@ -642,10 +651,10 @@ class DatabaseManager:
                     """
                     SELECT table_name, column_name, data_type, is_nullable, column_default
                     FROM information_schema.columns
-                    WHERE table_schema = 'public' AND table_name = ANY(%s)
+                    WHERE table_schema = %s AND table_name = ANY(%s)
                     ORDER BY table_name, ordinal_position
                 """,
-                    (table_names,),
+                    (db.schema, table_names),
                     deadline=deadline,
                 )
                 col_rows = cur.fetchall()
@@ -659,10 +668,10 @@ class DatabaseManager:
                     FROM information_schema.table_constraints tc
                     JOIN information_schema.key_column_usage kcu
                         ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-                    WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public'
+                    WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = %s
                         AND tc.table_name = ANY(%s)
                 """,
-                    (table_names,),
+                    (db.schema, table_names),
                     deadline=deadline,
                 )
                 pk_set = {(r[0], r[1]) for r in cur.fetchall()}
@@ -727,12 +736,12 @@ class DatabaseManager:
                         ON tgt_att.attrelid = c.confrelid
                         AND tgt_att.attnum = c.confkey[pos.i]
                     WHERE c.contype = 'f'
-                        AND src_ns.nspname = 'public'
-                        AND tgt_ns.nspname = 'public'
+                        AND src_ns.nspname = %s
+                        AND tgt_ns.nspname = %s
                     ORDER BY src.relname, c.conname, pos.i
                     LIMIT %s
                 """,
-                    (_MAX_FK_ROWS,),
+                    (db.schema, db.schema, _MAX_FK_ROWS),
                     deadline=deadline,
                 )
                 return [ForeignKey(*row) for row in cur.fetchall()]
@@ -829,11 +838,9 @@ class DatabaseManager:
         with self._connect(db) as conn:
             with conn.cursor() as cur:
                 deadline = self._new_deadline()
-                self._ensure_public_table_exists(
-                    cur, database, table, deadline=deadline
-                )
+                self._ensure_table_exists(cur, db, table, deadline=deadline)
 
-                tbl = self._public_table(table)
+                tbl = self._qualified_table(db, table)
 
                 self._execute(
                     cur,
@@ -848,10 +855,10 @@ class DatabaseManager:
                     """
                     SELECT column_name, data_type
                     FROM information_schema.columns
-                    WHERE table_schema = 'public' AND table_name = %s
+                    WHERE table_schema = %s AND table_name = %s
                     ORDER BY ordinal_position
                 """,
-                    (table,),
+                    (db.schema, table),
                     deadline=deadline,
                 )
                 columns = cur.fetchall()
@@ -926,7 +933,8 @@ class DatabaseManager:
         if period not in period_map:
             raise ValueError(f"Invalid period '{period}'. Use: {', '.join(period_map)}")
 
-        tbl = self._public_table(table)
+        db = self.get_database(database)
+        tbl = self._qualified_table(db, table)
         date_col = Identifier(date_column)
 
         if value_column:
@@ -949,15 +957,12 @@ class DatabaseManager:
                 "GROUP BY period ORDER BY period"
             ).format(date_col=date_col, tbl=tbl)
 
-        db = self.get_database(database)
         limit = self._settings.row_limit
 
         with self._connect(db) as conn:
             with conn.cursor() as cur:
                 deadline = self._new_deadline()
-                self._ensure_public_table_exists(
-                    cur, database, table, deadline=deadline
-                )
+                self._ensure_table_exists(cur, db, table, deadline=deadline)
 
                 # Validate column types up front so the agent gets a clear
                 # ValueError instead of an opaque Postgres error from
@@ -968,10 +973,10 @@ class DatabaseManager:
                     """
                     SELECT column_name, data_type
                     FROM information_schema.columns
-                    WHERE table_schema = 'public' AND table_name = %s
+                    WHERE table_schema = %s AND table_name = %s
                         AND column_name = ANY(%s)
                 """,
-                    (table, wanted),
+                    (db.schema, table, wanted),
                     deadline=deadline,
                 )
                 col_types = {r[0]: r[1] for r in cur.fetchall()}
@@ -1022,12 +1027,12 @@ class DatabaseManager:
         with self._connect(db) as conn:
             with conn.cursor() as cur:
                 deadline = self._new_deadline()
-                self._ensure_public_table_exists(
-                    cur, database, table, deadline=deadline
-                )
+                self._ensure_table_exists(cur, db, table, deadline=deadline)
                 self._execute(
                     cur,
-                    SQL("SELECT * FROM {} LIMIT %s").format(self._public_table(table)),
+                    SQL("SELECT * FROM {} LIMIT %s").format(
+                        self._qualified_table(db, table)
+                    ),
                     (limit,),
                     deadline=deadline,
                 )
@@ -1184,11 +1189,9 @@ class DatabaseManager:
         with self._connect(db) as conn:
             with conn.cursor() as cur:
                 deadline = self._new_deadline()
-                self._ensure_public_table_exists(
-                    cur, database, table, deadline=deadline
-                )
+                self._ensure_table_exists(cur, db, table, deadline=deadline)
 
-                tbl = self._public_table(table)
+                tbl = self._qualified_table(db, table)
 
                 self._execute(
                     cur,
@@ -1212,10 +1215,10 @@ class DatabaseManager:
                     """
                     SELECT column_name, data_type
                     FROM information_schema.columns
-                    WHERE table_schema = 'public' AND table_name = %s
+                    WHERE table_schema = %s AND table_name = %s
                     ORDER BY ordinal_position
                 """,
-                    (table,),
+                    (db.schema, table),
                     deadline=deadline,
                 )
                 columns = cur.fetchall()
@@ -1269,9 +1272,7 @@ class DatabaseManager:
         with self._connect(db) as conn:
             with conn.cursor() as cur:
                 deadline = self._new_deadline()
-                self._ensure_public_table_exists(
-                    cur, database, table, deadline=deadline
-                )
+                self._ensure_table_exists(cur, db, table, deadline=deadline)
 
                 self._execute(
                     cur,
@@ -1282,10 +1283,10 @@ class DatabaseManager:
                         COALESCE(pg_total_relation_size((quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass), 0) AS size_bytes
                     FROM information_schema.tables t
                     LEFT JOIN pg_stat_user_tables s ON s.relname = t.table_name AND s.schemaname = t.table_schema
-                    WHERE t.table_schema = 'public' AND t.table_name = %s
+                    WHERE t.table_schema = %s AND t.table_name = %s
                         AND t.table_type = 'BASE TABLE'
                 """,
-                    (table,),
+                    (db.schema, table),
                     deadline=deadline,
                 )
                 row = cur.fetchone()
@@ -1296,10 +1297,10 @@ class DatabaseManager:
                     """
                     SELECT column_name, data_type, is_nullable, column_default
                     FROM information_schema.columns
-                    WHERE table_schema = 'public' AND table_name = %s
+                    WHERE table_schema = %s AND table_name = %s
                     ORDER BY ordinal_position
                 """,
-                    (table,),
+                    (db.schema, table),
                     deadline=deadline,
                 )
                 col_rows = cur.fetchall()
@@ -1311,10 +1312,10 @@ class DatabaseManager:
                     FROM information_schema.table_constraints tc
                     JOIN information_schema.key_column_usage kcu
                         ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-                    WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public'
+                    WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = %s
                         AND tc.table_name = %s
                 """,
-                    (table,),
+                    (db.schema, table),
                     deadline=deadline,
                 )
                 pk_cols = {r[0] for r in cur.fetchall()}
@@ -1338,8 +1339,9 @@ class DatabaseManager:
         )
 
     def get_indexes(self, database: str, table: str | None = None) -> list[dict]:
-        """Non-primary-key indexes in the public schema (optionally one table):
-        name, columns, uniqueness. PKs are already shown as [PK] in schemas."""
+        """Non-primary-key indexes in the configured schema (optionally one
+        table): name, columns, uniqueness. PKs are already shown as [PK] in
+        schemas."""
         if table is not None:
             self._validate_identifier(table)
         db = self.get_database(database)
@@ -1358,9 +1360,9 @@ class DatabaseManager:
             JOIN pg_namespace n ON n.oid = t.relnamespace
             JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE
             LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
-            WHERE n.nspname = 'public' AND NOT ix.indisprimary
+            WHERE n.nspname = %s AND NOT ix.indisprimary
         """
-        params: list = []
+        params: list = [db.schema]
         if table is not None:
             sql += " AND t.relname = %s"
             params.append(table)

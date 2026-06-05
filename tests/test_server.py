@@ -216,6 +216,14 @@ class TestHealthTool:
         assert result == "[FAIL] prod: authentication failed"
 
 
+class TestSchemaTool:
+    def test_empty_database_reports_configured_schema(self, mock_manager):
+        mock_manager.get_schema.return_value = []
+        mock_manager.get_database.return_value.schema = "analytics"
+        result = server.schema("events")
+        assert result == "No tables found in 'events' (schema 'analytics')."
+
+
 class TestSummaryTool:
     def test_unexpected_error_does_not_leak(self, mock_manager):
         mock_manager.database_names = ["prod"]

@@ -191,7 +191,8 @@ def schema(database: str) -> str:
         return "Schema error: unexpected failure (check server logs)"
 
     if not tables:
-        return f"No tables found in '{database}' (public schema)."
+        schema_name = mgr.get_database(database).schema
+        return f"No tables found in '{database}' (schema '{schema_name}')."
 
     lines = [f"Schema for '{database}': {len(tables)} tables\n"]
     for t in tables:

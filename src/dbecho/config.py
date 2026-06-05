@@ -12,6 +12,14 @@ from pathlib import Path
 
 _ENV_VAR_RE = re.compile(r"\$\{([^}]+)\}")
 
+# Lowercase-only (stricter than db._SAFE_TABLE_RE): the schema name is
+# embedded unquoted in the search_path connection option, where Postgres
+# case-folds unquoted identifiers — an uppercase schema would silently make
+# raw queries target a different (case-folded) schema than the
+# case-preserving parametrized metadata queries. \Z (not $) so a trailing
+# newline cannot sneak past into the libpq options string.
+_SCHEMA_RE = re.compile(r"^[a-z_][a-z0-9_]*\Z")
+
 # Upper bounds are intentional safety guards: row_limit caps client-side fetch
 # size, so an operator typo (e.g. row_limit = 100000000) must not silently turn
 # every query into a multi-GB pull that can OOM the stdio server.
@@ -25,6 +33,10 @@ class DatabaseConfig:
     name: str
     url: str
     description: str = ""
+    # Schema that the metadata tools (schema/describe/analyze/...) target and
+    # that leads search_path for raw queries. Apps like the user's Go analytics
+    # service keep all tables outside public.
+    schema: str = "public"
 
 
 @dataclass
@@ -66,7 +78,7 @@ class Config:
 
 
 _SETTINGS_FIELDS = {f.name for f in Settings.__dataclass_fields__.values()}
-_DATABASE_FIELDS = {"url", "description"}
+_DATABASE_FIELDS = {"url", "description", "schema"}
 
 
 def _expand_env(value: str) -> str:
@@ -126,11 +138,18 @@ def load_config(path: Path) -> Config:
         description = db_data.get("description", "")
         if not isinstance(description, str):
             raise ValueError(f"[databases.{name}].description must be a string")
+        schema = db_data.get("schema", "public")
+        if not isinstance(schema, str) or not _SCHEMA_RE.match(schema):
+            raise ValueError(
+                f"[databases.{name}].schema must be a plain lowercase identifier "
+                "(letters, digits, underscores; not starting with a digit)"
+            )
         databases.append(
             DatabaseConfig(
                 name=name,
                 url=url,
                 description=description,
+                schema=schema,
             )
         )
 

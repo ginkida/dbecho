@@ -221,6 +221,100 @@ description = 42
         load_config(p)
 
 
+def test_schema_defaults_to_public(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+""",
+    )
+    config = load_config(p)
+    assert config.databases[0].schema == "public"
+
+
+def test_schema_custom_value(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+schema = "analytics"
+""",
+    )
+    config = load_config(p)
+    assert config.databases[0].schema == "analytics"
+
+
+def test_schema_invalid_identifier_rejected(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+schema = "bad-name; drop"
+""",
+    )
+    with pytest.raises(ValueError, match="schema must be a plain lowercase"):
+        load_config(p)
+
+
+def test_schema_non_string_rejected(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+schema = 42
+""",
+    )
+    with pytest.raises(ValueError, match="schema must be a plain lowercase"):
+        load_config(p)
+
+
+def test_schema_leading_digit_rejected(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+schema = "1analytics"
+""",
+    )
+    with pytest.raises(ValueError, match="schema must be a plain lowercase"):
+        load_config(p)
+
+
+def test_schema_uppercase_rejected(tmp_path):
+    # Unquoted search_path case-folds, so an uppercase schema would silently
+    # diverge from the case-preserving parametrized metadata queries.
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+schema = "Analytics"
+""",
+    )
+    with pytest.raises(ValueError, match="schema must be a plain lowercase"):
+        load_config(p)
+
+
+def test_schema_trailing_newline_rejected(tmp_path):
+    # Pins the \\Z anchor: a $-anchored regex would accept "analytics\n",
+    # which is interpolated into the libpq options string (search_path).
+    p = write_toml(
+        tmp_path,
+        """
+[databases.db1]
+url = "postgres://localhost/db1"
+schema = "analytics\\n"
+""",
+    )
+    with pytest.raises(ValueError, match="schema must be a plain lowercase"):
+        load_config(p)
+
+
 def test_no_env_var_plain_url(tmp_path):
     p = write_toml(
         tmp_path,
