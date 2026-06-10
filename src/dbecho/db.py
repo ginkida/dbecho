@@ -62,6 +62,8 @@ _ALLOWED_SQL_PREFIXES = ("SELECT", "WITH", "SHOW")
 _MAX_COLUMNS_FOR_STATS = 80
 _MAX_SCHEMA_TABLES = 5000  # cap materialized table metadata to bound memory
 _MAX_FK_ROWS = 10000  # cap relationship/index result sets
+_MAX_FIND_RESULTS = 100  # cap name-search matches per kind per database
+_MAX_FIND_PATTERN_LEN = 200
 
 # Data-modifying keywords. The read-only connection is the real write barrier,
 # but a first-keyword whitelist alone lets data-modifying CTEs
@@ -317,6 +319,14 @@ def _validate_explain_body(clean: str) -> None:
                 "Query uses a blocked function (filesystem/large-object/dblink/"
                 "set_config access is not allowed)"
             )
+
+
+def _escape_like(pattern: str) -> str:
+    """Escape LIKE/ILIKE metacharacters so a search pattern matches literally.
+
+    Backslash first (it is the default LIKE escape character), then % and _.
+    """
+    return pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _looks_like_identifier_column(name: str) -> bool:
@@ -1386,6 +1396,69 @@ class DatabaseManager:
                     }
                     for r in cur.fetchall()
                 ]
+
+    def find_objects(self, database: str, pattern: str) -> dict:
+        """Find tables and columns in the configured schema whose names contain
+        `pattern` (case-insensitive substring; LIKE metacharacters are matched
+        literally). Cheap discovery before pulling a full schema."""
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ValueError("pattern must be a non-empty string")
+        pattern = pattern.strip()
+        if len(pattern) > _MAX_FIND_PATTERN_LEN:
+            raise ValueError(
+                f"pattern is too long (max {_MAX_FIND_PATTERN_LEN} characters)"
+            )
+        db = self.get_database(database)
+        like = f"%{_escape_like(pattern)}%"
+
+        with self._connect(db) as conn:
+            with conn.cursor() as cur:
+                deadline = self._new_deadline()
+                self._execute(
+                    cur,
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = %s AND table_type = 'BASE TABLE'
+                        AND table_name ILIKE %s
+                    ORDER BY table_name
+                    LIMIT %s
+                """,
+                    (db.schema, like, _MAX_FIND_RESULTS + 1),
+                    deadline=deadline,
+                )
+                tables = [r[0] for r in cur.fetchall()]
+
+                # Join against tables so view columns don't surface objects
+                # that schema/describe (BASE TABLE only) would then not find.
+                self._execute(
+                    cur,
+                    """
+                    SELECT c.table_name, c.column_name, c.data_type
+                    FROM information_schema.columns c
+                    JOIN information_schema.tables t
+                        ON t.table_schema = c.table_schema
+                        AND t.table_name = c.table_name
+                    WHERE c.table_schema = %s AND t.table_type = 'BASE TABLE'
+                        AND c.column_name ILIKE %s
+                    ORDER BY c.table_name, c.ordinal_position
+                    LIMIT %s
+                """,
+                    (db.schema, like, _MAX_FIND_RESULTS + 1),
+                    deadline=deadline,
+                )
+                columns = [
+                    {"table": r[0], "column": r[1], "type": r[2]}
+                    for r in cur.fetchall()
+                ]
+
+        truncated = len(tables) > _MAX_FIND_RESULTS or len(columns) > _MAX_FIND_RESULTS
+        return {
+            "database": database,
+            "tables": tables[:_MAX_FIND_RESULTS],
+            "columns": columns[:_MAX_FIND_RESULTS],
+            "truncated": truncated,
+        }
 
     def explain(self, database: str, sql: str) -> dict:
         """Planner estimates (cost, rows) for a SELECT/WITH query without

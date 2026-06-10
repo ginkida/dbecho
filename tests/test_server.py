@@ -274,6 +274,83 @@ class TestDescribeTool:
         assert result.startswith("Describe error:")
 
 
+class TestFindTool:
+    def test_formats_matches_and_skips_empty_dbs(self, mock_manager):
+        mock_manager.database_names = ["db1", "db2"]
+        mock_manager.find_objects.side_effect = [
+            {
+                "database": "db1",
+                "tables": ["user_emails"],
+                "columns": [{"table": "users", "column": "email", "type": "text"}],
+                "truncated": False,
+            },
+            {"database": "db2", "tables": [], "columns": [], "truncated": False},
+        ]
+        result = server.find("email")
+        assert "## db1" in result
+        assert "Tables: user_emails" in result
+        assert "users.email: text" in result
+        assert "## db2" not in result
+
+    def test_no_matches(self, mock_manager):
+        mock_manager.database_names = ["db1"]
+        mock_manager.find_objects.return_value = {
+            "database": "db1",
+            "tables": [],
+            "columns": [],
+            "truncated": False,
+        }
+        result = server.find("nothing")
+        assert "No tables or columns matching 'nothing'" in result
+
+    def test_bad_pattern_fails_once(self, mock_manager):
+        mock_manager.database_names = ["db1", "db2"]
+        mock_manager.find_objects.side_effect = ValueError(
+            "pattern must be a non-empty string"
+        )
+        result = server.find(" ")
+        assert result == "Find error: pattern must be a non-empty string"
+        assert mock_manager.find_objects.call_count == 1
+
+    def test_unknown_database(self, mock_manager):
+        mock_manager.get_database.side_effect = ValueError(
+            "Unknown database 'x'. Available: db1"
+        )
+        result = server.find("email", database="x")
+        assert result.startswith("Find error: Unknown database 'x'")
+
+    def test_single_database_scope(self, mock_manager):
+        mock_manager.find_objects.return_value = {
+            "database": "db1",
+            "tables": ["users"],
+            "columns": [],
+            "truncated": False,
+        }
+        result = server.find("user", database="db1")
+        mock_manager.find_objects.assert_called_once_with("db1", "user")
+        assert "## db1" in result
+
+    def test_unexpected_error_sanitized(self, mock_manager):
+        mock_manager.database_names = ["db1"]
+        mock_manager.find_objects.side_effect = RuntimeError(
+            "password=hunter2 host=10.0.0.1"
+        )
+        result = server.find("email")
+        assert "hunter2" not in result
+        assert "unexpected failure" in result
+
+    def test_truncation_note(self, mock_manager):
+        mock_manager.database_names = ["db1"]
+        mock_manager.find_objects.return_value = {
+            "database": "db1",
+            "tables": ["t"],
+            "columns": [],
+            "truncated": True,
+        }
+        result = server.find("t")
+        assert "truncated" in result
+
+
 class TestExplainTool:
     def test_renders_plan_summary(self, mock_manager):
         mock_manager.explain.return_value = {

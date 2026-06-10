@@ -6,7 +6,9 @@ from psycopg.sql import SQL, Identifier
 
 from dbecho.db import (
     DatabaseManager,
+    _MAX_FIND_RESULTS,
     _SAFE_TABLE_RE,
+    _escape_like,
     _is_sensitive_column,
     _safe_conn_error,
 )
@@ -1471,6 +1473,104 @@ class TestGetIndexes:
         mgr = make_manager()
         with pytest.raises(ValueError, match="Invalid identifier"):
             mgr.get_indexes("test", "bad;name")
+
+
+class TestEscapeLike:
+    def test_metacharacters_escaped(self):
+        assert _escape_like("100%") == "100\\%"
+        assert _escape_like("a_b") == "a\\_b"
+        assert _escape_like("a\\b") == "a\\\\b"
+
+    def test_plain_text_unchanged(self):
+        assert _escape_like("email") == "email"
+
+
+class TestFindObjects:
+    def test_finds_tables_and_columns(self):
+        cur = MagicMock()
+        cur.fetchall = MagicMock(
+            side_effect=[
+                # matching tables
+                [("user_emails",)],
+                # matching columns
+                [
+                    ("users", "email", "character varying"),
+                    ("subscribers", "email", "text"),
+                ],
+            ]
+        )
+
+        with mock_connection(cur):
+            mgr = make_manager()
+            result = mgr.find_objects("test", "email")
+
+        assert result["database"] == "test"
+        assert result["tables"] == ["user_emails"]
+        assert result["columns"] == [
+            {"table": "users", "column": "email", "type": "character varying"},
+            {"table": "subscribers", "column": "email", "type": "text"},
+        ]
+        assert result["truncated"] is False
+
+    def test_pattern_wildcards_matched_literally(self):
+        cur = MagicMock()
+        cur.fetchall = MagicMock(side_effect=[[], []])
+
+        with mock_connection(cur):
+            mgr = make_manager()
+            mgr.find_objects("test", "100%_done")
+
+        like_params = [
+            call.args[1]
+            for call in cur.execute.call_args_list
+            if len(call.args) > 1 and call.args[1]
+        ]
+        assert like_params, "expected parametrized ILIKE queries"
+        for params in like_params:
+            assert params[1] == "%100\\%\\_done%"
+
+    def test_empty_pattern_rejected(self):
+        mgr = make_manager()
+        with pytest.raises(ValueError, match="non-empty"):
+            mgr.find_objects("test", "   ")
+
+    def test_long_pattern_rejected(self):
+        mgr = make_manager()
+        with pytest.raises(ValueError, match="too long"):
+            mgr.find_objects("test", "x" * 201)
+
+    def test_truncation_flag_and_cap(self):
+        cur = MagicMock()
+        cur.fetchall = MagicMock(
+            side_effect=[
+                [(f"t{i}",) for i in range(_MAX_FIND_RESULTS + 1)],
+                [],
+            ]
+        )
+
+        with mock_connection(cur):
+            mgr = make_manager()
+            result = mgr.find_objects("test", "t")
+
+        assert result["truncated"] is True
+        assert len(result["tables"]) == _MAX_FIND_RESULTS
+
+    def test_targets_configured_schema(self):
+        cur = MagicMock()
+        cur.fetchall = MagicMock(side_effect=[[], []])
+
+        with mock_connection(cur):
+            mgr = make_manager(schema="analytics")
+            mgr.find_objects("test", "ev")
+
+        for call in cur.execute.call_args_list:
+            if len(call.args) > 1 and call.args[1]:
+                assert call.args[1][0] == "analytics"
+
+    def test_unknown_database(self):
+        mgr = make_manager()
+        with pytest.raises(ValueError, match="Unknown database"):
+            mgr.find_objects("nope", "email")
 
 
 class TestExplain:

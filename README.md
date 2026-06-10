@@ -20,7 +20,7 @@ Claude: [runs schema → query → analyze → trend across 29 tables]
 
 ## What can it do?
 
-**13 tools** that cover the full analytics workflow:
+**14 tools** that cover the full analytics workflow:
 
 | Tool | Purpose |
 |------|---------|
@@ -28,6 +28,7 @@ Claude: [runs schema → query → analyze → trend across 29 tables]
 | `health` | Check connectivity, PostgreSQL version, database size |
 | `schema` | Full schema: tables, columns, types, PKs, row counts, sizes |
 | `describe` | One table in depth: columns, PK, indexes, size — cheaper than `schema` |
+| `find` | Locate tables and columns by name substring, across all databases at once |
 | `query` | Run read-only SQL (SELECT, WITH, EXPLAIN, SHOW), with offset paging and JSON output |
 | `explain` | Query plan with estimated cost/rows — judge a query before running it |
 | `analyze` | Profile a table: nulls, cardinality, distributions, top values |
@@ -223,7 +224,7 @@ For production databases, the strongest setup is still a **least-privilege role*
 src/dbecho/
   config.py   TOML config loading, env var expansion, validation
   db.py       DatabaseManager: connections, schema cache, queries, stats, trends, anomalies
-  server.py   FastMCP server: 13 tools, 3 resources, 3 prompts
+  server.py   FastMCP server: 14 tools, 3 resources, 3 prompts
 ```
 
 ~2000 lines of Python total. No framework beyond `mcp` and `psycopg`.

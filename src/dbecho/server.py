@@ -24,7 +24,8 @@ mcp = FastMCP(
     instructions=(
         "dbecho is a multi-database PostgreSQL analytics server. "
         "Start with list_databases or summary to see available databases. "
-        "Use schema to explore structure (describe for a single table), "
+        "Use find to locate tables/columns by name across databases, "
+        "schema to explore structure (describe for a single table), "
         "query for SQL (explain to preview cost first), analyze to profile "
         "tables, compare to cross-reference databases, trend for time series, "
         "anomalies to find data issues, sample to preview rows, "
@@ -289,6 +290,66 @@ def describe(database: str, table: str) -> str:
             lines.append(f"  {ix['name']}{unique} ({ix['columns']})")
 
     return "\n".join(lines)
+
+
+@mcp.tool()
+def find(pattern: str, database: str | None = None) -> str:
+    """Find tables and columns by name across databases.
+
+    Case-insensitive substring match on table and column names (LIKE
+    wildcards are matched literally). Use this to locate where data lives
+    before pulling full schemas.
+
+    Args:
+        pattern: Substring to search for in table/column names (e.g. "email").
+        database: Optional database name to search. If omitted, searches all
+            configured databases.
+    """
+    mgr = _get_manager()
+    if database is not None:
+        try:
+            mgr.get_database(database)
+        except ValueError as e:
+            return f"Find error: {e}"
+        names = [database]
+    else:
+        names = mgr.database_names
+
+    sections = []
+    searched = 0
+    for name in names:
+        try:
+            result = mgr.find_objects(name, pattern)
+        except ValueError as e:
+            # A pattern problem is identical for every database — fail once.
+            return f"Find error: {e}"
+        except TimeoutError as e:
+            sections.append(f"## {name}\n  Error: {e}")
+            continue
+        except Exception:
+            logger.exception("Find failed on %s", name)
+            sections.append(
+                f"## {name}\n  Error: unexpected failure (check server logs)"
+            )
+            continue
+
+        searched += 1
+        if not result["tables"] and not result["columns"]:
+            continue
+        lines = [f"## {name}"]
+        if result["tables"]:
+            lines.append(f"  Tables: {', '.join(result['tables'])}")
+        if result["columns"]:
+            lines.append("  Columns:")
+            for c in result["columns"]:
+                lines.append(f"    {c['table']}.{c['column']}: {c['type']}")
+        if result["truncated"]:
+            lines.append("  (match list truncated — use a more specific pattern)")
+        sections.append("\n".join(lines))
+
+    if not sections:
+        return f"No tables or columns matching '{pattern}' in {searched} database(s)."
+    return "\n\n".join(sections)
 
 
 @mcp.tool()
