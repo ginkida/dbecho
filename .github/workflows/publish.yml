@@ -31,6 +31,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      # PyPI versions are immutable — a tag/pyproject mismatch would burn the
+      # number permanently. Fail loudly before building if they disagree.
+      - name: Verify release tag matches pyproject version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "release tag: ${tag} | pyproject version: ${pkg}"
+          if [ "${tag}" != "${pkg}" ]; then
+            echo "::error::Release tag (${tag}) does not match pyproject version (${pkg})"
+            exit 1
+          fi
+
       - name: Install build tools
         run: pip install build
 

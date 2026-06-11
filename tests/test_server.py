@@ -1,4 +1,5 @@
 import json
+import sys
 
 import pytest
 from unittest.mock import MagicMock
@@ -363,3 +364,120 @@ class TestExplainTool:
         assert "Seq Scan" in result
         assert "15.5" in result
         assert "100" in result
+
+
+class TestTrendTool:
+    def test_json_format(self, mock_manager):
+        mock_manager.get_trend.return_value = QueryResult(
+            columns=["period", "count"], rows=[["2026-01", 42]], row_count=1
+        )
+        parsed = json.loads(server.trend("db", "orders", "created_at", format="json"))
+        assert parsed["columns"] == ["period", "count"]
+        assert parsed["rows"] == [["2026-01", 42]]
+
+    def test_unknown_format_rejected(self, mock_manager):
+        result = server.trend("db", "orders", "created_at", format="csv")
+        assert "unknown format" in result
+        mock_manager.get_trend.assert_not_called()
+
+    def test_table_format_default(self, mock_manager):
+        mock_manager.get_trend.return_value = QueryResult(
+            columns=["period", "count"], rows=[["2026-01", 42]], row_count=1
+        )
+        result = server.trend("db", "orders", "created_at")
+        assert "2026-01" in result
+        assert "42" in result
+
+
+class TestMain:
+    def test_version_flag_prints_and_exits(self, monkeypatch, capsys):
+        # Must short-circuit before config load: leave _manager unset and
+        # stub mcp so an accidental fall-through is visible.
+        monkeypatch.setattr(server, "_manager", None)
+        mock_mcp = MagicMock()
+        monkeypatch.setattr(server, "mcp", mock_mcp)
+        monkeypatch.setattr(sys, "argv", ["dbecho", "--version"])
+
+        server.main()
+
+        out = capsys.readouterr().out
+        assert out.startswith("dbecho ")
+        assert out.strip() != "dbecho"
+        mock_mcp.run.assert_not_called()
+
+    def test_check_all_ok_exits_zero(self, mock_manager, monkeypatch, capsys):
+        mock_mcp = MagicMock()
+        monkeypatch.setattr(server, "mcp", mock_mcp)
+        monkeypatch.setattr(sys, "argv", ["dbecho", "--check"])
+        mock_manager.database_names = ["blog", "stats"]
+        mock_manager.check_connection.side_effect = [
+            {"status": "ok", "version": "PostgreSQL 16.1", "size": "110 MB"},
+            {"status": "ok", "version": "PostgreSQL 16.1", "size": "28 MB"},
+        ]
+
+        with pytest.raises(SystemExit) as exc:
+            server.main()
+
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "[OK] blog: PostgreSQL 16.1 | 110 MB" in out
+        assert "[OK] stats" in out
+        mock_mcp.run.assert_not_called()
+
+    def test_check_failure_exits_nonzero(self, mock_manager, monkeypatch, capsys):
+        mock_mcp = MagicMock()
+        monkeypatch.setattr(server, "mcp", mock_mcp)
+        monkeypatch.setattr(sys, "argv", ["dbecho", "--check"])
+        mock_manager.database_names = ["blog", "stats"]
+        mock_manager.check_connection.side_effect = [
+            {"status": "ok", "version": "PostgreSQL 16.1", "size": "110 MB"},
+            {"status": "error", "error": "connection failed (host unreachable)"},
+        ]
+
+        with pytest.raises(SystemExit) as exc:
+            server.main()
+
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "[OK] blog" in out
+        assert "[FAIL] stats: connection failed (host unreachable)" in out
+        mock_mcp.run.assert_not_called()
+
+    def test_broken_config_exits_one(self, monkeypatch, capsys):
+        monkeypatch.setattr(server, "_manager", None)
+        monkeypatch.setattr(
+            sys, "argv", ["dbecho", "--check", "--config=/nonexistent/dbecho.toml"]
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            server.main()
+
+        assert exc.value.code == 1
+
+    def test_version_falls_back_when_metadata_missing(self, monkeypatch, capsys):
+        # When the package metadata is absent (e.g. a bare source checkout),
+        # --version must print "dbecho unknown" rather than raising.
+        from importlib.metadata import PackageNotFoundError
+
+        monkeypatch.setattr(server, "_manager", None)
+        monkeypatch.setattr(
+            server, "_package_version", MagicMock(side_effect=PackageNotFoundError)
+        )
+        monkeypatch.setattr(sys, "argv", ["dbecho", "--version"])
+
+        server.main()
+
+        assert capsys.readouterr().out.strip() == "dbecho unknown"
+
+    def test_version_wins_over_check(self, mock_manager, monkeypatch, capsys):
+        # --version short-circuits before config load and --check, so no DB is
+        # pinged and the MCP loop never starts.
+        mock_mcp = MagicMock()
+        monkeypatch.setattr(server, "mcp", mock_mcp)
+        monkeypatch.setattr(sys, "argv", ["dbecho", "--version", "--check"])
+
+        server.main()
+
+        assert capsys.readouterr().out.startswith("dbecho ")
+        mock_manager.check_connection.assert_not_called()
+        mock_mcp.run.assert_not_called()

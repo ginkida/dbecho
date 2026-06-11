@@ -34,7 +34,7 @@ Claude: [runs schema → query → analyze → trend across 29 tables]
 | `analyze` | Profile a table: nulls, cardinality, distributions, top values |
 | `compare` | Same query across multiple databases, side by side |
 | `summary` | Overview: table counts, total rows, largest tables |
-| `trend` | Time-series: counts/averages grouped by day/week/month/year |
+| `trend` | Time-series: counts/averages grouped by day/week/month/year, with JSON output |
 | `anomalies` | Data quality: high nulls, outliers, duplicates, future dates |
 | `sample` | Preview rows from any table |
 | `erd` | Entity-relationship diagram: PKs and foreign keys |
@@ -149,6 +149,17 @@ names:
 url = "${EVENTS_DATABASE_URL}"
 schema = "analytics"
 ```
+
+Verify the config and connectivity before wiring up your MCP client:
+
+```bash
+dbecho --check     # validate config + ping every database
+dbecho --version   # print "dbecho <version>"
+```
+
+`--check` prints a `[OK]`/`[FAIL] <name>: …` line per database and exits 0 only
+when every database responds (non-zero otherwise), so it drops straight into a
+CI or healthcheck script.
 
 ### 3. Connect to your MCP client
 

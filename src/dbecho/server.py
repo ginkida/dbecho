@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _package_version
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -535,6 +537,7 @@ def trend(
     date_column: str,
     value_column: str | None = None,
     period: str = "month",
+    format: str = "table",
 ) -> str:
     """Analyze time series data: group rows by time period and show counts, averages, and totals.
 
@@ -544,7 +547,11 @@ def trend(
         date_column: Name of the date/timestamp column to group by.
         value_column: Optional numeric column to aggregate (avg, sum). If omitted, shows counts only.
         period: Grouping period: day, week, month, quarter, year. Default: month.
+        format: "table" (default, ASCII table) or "json" ({columns, rows,
+            row_count, truncated}).
     """
+    if format not in ("table", "json"):
+        return f"Trend error: unknown format '{format}'. Use: table, json"
     mgr = _get_manager()
     try:
         result = mgr.get_trend(database, table, date_column, value_column, period)
@@ -555,6 +562,9 @@ def trend(
     except Exception:
         logger.exception("Trend failed on %s.%s", database, table)
         return "Trend error: unexpected failure (check server logs)"
+
+    if format == "json":
+        return _to_json(result)
 
     output = _format_table(result.columns, result.rows)
     suffix = (
@@ -762,19 +772,44 @@ def data_quality_report(database: str) -> str:
     )
 
 
+def _version() -> str:
+    try:
+        return _package_version("dbecho")
+    except PackageNotFoundError:
+        return "unknown"
+
+
 def main():
     # stdio MCP uses stdout for the JSON-RPC protocol — force all logging to
     # stderr regardless of what any imported library configured first.
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
 
+    # --version / --check run before the MCP loop, so stdout is still ours.
+    if "--version" in sys.argv:
+        print(f"dbecho {_version()}")
+        return
+
     # Validate config eagerly so a broken config (missing file, unset ${VAR},
     # malformed TOML) fails loudly at launch for the operator instead of
     # surfacing mid-session on the first tool call. No DB I/O happens here.
     try:
-        _get_manager()
+        mgr = _get_manager()
     except Exception as e:
         logger.error("Startup failed: %s", e)
         raise SystemExit(1)
+
+    if "--check" in sys.argv:
+        # Operator smoke test: config is valid (above) — now ping every
+        # database and exit non-zero if any is unreachable.
+        all_ok = True
+        for name in mgr.database_names:
+            info = mgr.check_connection(name)
+            if info["status"] == "ok":
+                print(f"[OK] {name}: {info['version']} | {info['size']}")
+            else:
+                all_ok = False
+                print(f"[FAIL] {name}: {info['error']}")
+        raise SystemExit(0 if all_ok else 1)
 
     mcp.run()
 
