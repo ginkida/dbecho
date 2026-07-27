@@ -20,6 +20,10 @@ _MAX_CELL_CHARS = 200
 # Generous cap on the compare() fan-out so a repeated/attacker-supplied list
 # cannot multiply an expensive query arbitrarily.
 _MAX_COMPARE_DBS = 20
+# MCP clients fetch a resource wholesale, so its table listing is capped: a
+# 5000-table database (the schema cap) would otherwise dump 5000 lines straight
+# into the agent's context. The tools remain the way to see everything.
+_MAX_RESOURCE_TABLES = 50
 
 mcp = FastMCP(
     "dbecho",
@@ -132,6 +136,25 @@ def _to_json(result) -> str:
     )
 
 
+def _omitted_columns_note(result: dict, verb: str) -> str:
+    """Announce a wide-table cap. Returns "" when nothing was omitted.
+
+    A partial profile that looks complete is worse than an error, so the count
+    and a sample of the skipped names always accompany the result.
+    """
+    omitted = result.get("omitted_columns")
+    if not omitted:
+        return ""
+    total = result.get("column_count", len(omitted))
+    preview = ", ".join(omitted[:5])
+    more = f", … (+{len(omitted) - 5} more)" if len(omitted) > 5 else ""
+    return (
+        f"\n({verb} the first {total - len(omitted)} of {total} columns in ordinal "
+        f"order — {len(omitted)} omitted: {preview}{more}. "
+        f"Use query for the remaining columns.)"
+    )
+
+
 def _format_size(size_bytes: int | float) -> str:
     value = float(size_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -177,7 +200,9 @@ def schema(database: str) -> str:
     """Get the full schema of a database: tables, columns, types, primary keys, row counts, and sizes.
 
     Row counts are PostgreSQL planner estimates (0 for never-analyzed tables);
-    use analyze or query for exact counts.
+    use analyze or query for exact counts. Partitioned tables are listed once
+    as the parent, marked [partitioned], with rows and size summed across all
+    partitions; query the parent and let PostgreSQL prune.
 
     Args:
         database: Name of the database from config (use list_databases to see available).
@@ -201,7 +226,10 @@ def schema(database: str) -> str:
     for t in tables:
         comment = f"  -- {t.comment}" if t.comment else ""
         size = _format_size(t.size_bytes)
-        lines.append(f"## {t.name} (~{t.row_count:,} rows est., {size}){comment}")
+        marker = " [partitioned]" if t.is_partitioned else ""
+        lines.append(
+            f"## {t.name}{marker} (~{t.row_count:,} rows est., {size}){comment}"
+        )
         for col in t.columns:
             pk = " [PK]" if col.is_primary_key else ""
             nullable = "NULL" if col.nullable else "NOT NULL"
@@ -258,7 +286,9 @@ def query(database: str, sql: str, offset: int = 0, format: str = "table") -> st
 def describe(database: str, table: str) -> str:
     """Describe a single table: columns, types, primary key, indexes, row estimate, size.
 
-    Much cheaper than schema when you only need one table.
+    Much cheaper than schema when you only need one table. Works on a partition
+    child too, even though schema and find list only the parent; for a parent,
+    rows and size cover the whole partition tree.
 
     Args:
         database: Name of the database from config.
@@ -278,7 +308,8 @@ def describe(database: str, table: str) -> str:
 
     comment = f"  -- {info.comment}" if info.comment else ""
     size = _format_size(info.size_bytes)
-    lines = [f"## {info.name} (~{info.row_count:,} rows est., {size}){comment}"]
+    marker = " [partitioned]" if info.is_partitioned else ""
+    lines = [f"## {info.name}{marker} (~{info.row_count:,} rows est., {size}){comment}"]
     for col in info.columns:
         pk = " [PK]" if col.is_primary_key else ""
         nullable = "NULL" if col.nullable else "NOT NULL"
@@ -301,6 +332,9 @@ def find(pattern: str, database: str | None = None) -> str:
     Case-insensitive substring match on table and column names (LIKE
     wildcards are matched literally). Use this to locate where data lives
     before pulling full schemas.
+
+    Partition children are not listed — a partitioned table matches once, as
+    its parent. To inspect one specific partition, pass its name to describe.
 
     Args:
         pattern: Substring to search for in table/column names (e.g. "email").
@@ -350,7 +384,13 @@ def find(pattern: str, database: str | None = None) -> str:
         sections.append("\n".join(lines))
 
     if not sections:
-        return f"No tables or columns matching '{pattern}' in {searched} database(s)."
+        # Say why a name that exists can still miss: partition children are
+        # filtered out of the search, so `events_2026_06` finds nothing.
+        return (
+            f"No tables or columns matching '{pattern}' in {searched} database(s). "
+            f"(Partition children are not searched — try the parent table's name, "
+            f"or describe a partition directly by name.)"
+        )
     return "\n\n".join(sections)
 
 
@@ -389,6 +429,10 @@ def explain(database: str, sql: str) -> str:
 @mcp.tool()
 def analyze(database: str, table: str) -> str:
     """Profile a table: row count, column types, null percentages, distinct values, min/max/avg for numeric columns, top values for low-cardinality text columns.
+
+    At most 80 columns are profiled; a wider table returns a partial profile
+    that names the omitted columns. Tables above the configured
+    max_profile_rows are refused — use sample, trend or query instead.
 
     Args:
         database: Name of the database from config.
@@ -435,6 +479,10 @@ def analyze(database: str, table: str) -> str:
             f"\n(skipped columns after failed probes: "
             f"{', '.join(stats['skipped_columns'])})"
         )
+
+    note = _omitted_columns_note(stats, "profiled")
+    if note:
+        lines.append(note)
 
     return "\n".join(lines)
 
@@ -579,6 +627,9 @@ def trend(
 def anomalies(database: str, table: str) -> str:
     """Find data quality issues in a table: high null rates, single-value columns, numeric outliers, future dates, possible duplicates.
 
+    At most 80 columns are checked; a wider table returns a partial report that
+    names the omitted columns.
+
     Args:
         database: Name of the database from config.
         table: Name of the table to check.
@@ -612,6 +663,10 @@ def anomalies(database: str, table: str) -> str:
             f"\n(skipped columns after failed probes: "
             f"{', '.join(result['skipped_columns'])})"
         )
+
+    note = _omitted_columns_note(result, "checked")
+    if note:
+        lines.append(note)
 
     return "\n".join(lines)
 
@@ -664,7 +719,8 @@ def erd(database: str) -> str:
     for t in tables:
         pk_cols = [c.name for c in t.columns if c.is_primary_key]
         pk_str = f" (PK: {', '.join(pk_cols)})" if pk_cols else ""
-        lines.append(f"[{t.name}]{pk_str} -- ~{t.row_count:,} rows (est.)")
+        marker = " [partitioned]" if t.is_partitioned else ""
+        lines.append(f"[{t.name}]{marker}{pk_str} -- ~{t.row_count:,} rows (est.)")
 
     if fks:
         lines.append("\nRelationships:")
@@ -714,10 +770,21 @@ def resource_summary(database: str) -> str:
         tables = mgr.get_schema(database)
         total_rows = sum(t.row_count for t in tables)
         total_size = sum(t.size_bytes for t in tables)
+        # Largest-first so the cap keeps the interesting tables, and say what
+        # was left out — a silently short list reads as the whole database.
+        shown = sorted(tables, key=lambda t: t.row_count, reverse=True)[
+            :_MAX_RESOURCE_TABLES
+        ]
         table_list = "\n".join(
-            f"  - {t.name}: ~{t.row_count:,} rows (est.), {_format_size(t.size_bytes)}"
-            for t in tables
+            f"  - {t.name}{' [partitioned]' if t.is_partitioned else ''}: "
+            f"~{t.row_count:,} rows (est.), {_format_size(t.size_bytes)}"
+            for t in shown
         )
+        if len(tables) > len(shown):
+            table_list += (
+                f"\n  … {len(tables) - len(shown)} more tables not listed "
+                f"(showing the {_MAX_RESOURCE_TABLES} largest; use the schema tool for all)"
+            )
         return f"Database: {database}\nTables: {len(tables)}\nTotal rows: ~{total_rows:,} (est.)\nTotal size: {_format_size(total_size)}\n\n{table_list}"
     except ValueError as e:
         return f"Error loading summary for '{database}': {e}"
@@ -779,12 +846,72 @@ def _version() -> str:
         return "unknown"
 
 
+_USAGE = """dbecho — MCP server for multi-database PostgreSQL analytics
+
+Usage:
+  dbecho [--config <path>]   serve MCP over stdio (default)
+  dbecho --check             validate config, ping every database, exit non-zero on failure
+  dbecho --version           print the installed version
+  dbecho --help              show this message
+
+Options:
+  --config <path>            path to dbecho.toml (also accepts --config=<path>).
+                             When omitted, dbecho looks for ./dbecho.toml, then
+                             ~/.config/dbecho/config.toml, then ~/.dbecho.toml."""
+
+_KNOWN_FLAGS = frozenset({"--version", "--check", "--help", "-h"})
+
+
+def _argv_error(argv: list[str]) -> str | None:
+    """Return the usage problem in argv, or None if every argument is understood.
+
+    Flag handling is hand-rolled rather than argparse (only a handful of flags,
+    and _get_manager() re-reads --config on its own), but an unrecognised
+    argument must not be silently ignored: `dbecho --verison` would otherwise
+    start a normal server and the operator would think the flag took effect.
+    """
+    unknown = []
+    expect_config_value = False
+    for arg in argv[1:]:
+        if expect_config_value:
+            expect_config_value = False
+            continue
+        if arg == "--config":
+            expect_config_value = True
+            continue
+        if arg.startswith("--config="):
+            if not arg.split("=", 1)[1]:
+                return "--config= requires a path"
+            continue
+        if arg in _KNOWN_FLAGS:
+            continue
+        unknown.append(arg)
+
+    if expect_config_value:
+        return "--config requires a path"
+    if unknown:
+        plural = "s" if len(unknown) > 1 else ""
+        return f"unknown argument{plural}: {' '.join(unknown)}"
+    return None
+
+
 def main():
     # stdio MCP uses stdout for the JSON-RPC protocol — force all logging to
     # stderr regardless of what any imported library configured first.
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
 
-    # --version / --check run before the MCP loop, so stdout is still ours.
+    # --help / --version / --check run before the MCP loop, so stdout is still
+    # ours rather than the JSON-RPC channel.
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(_USAGE)
+        return
+
+    # Usage errors exit 2 (distinct from 1, which means "config/startup broke").
+    problem = _argv_error(sys.argv)
+    if problem is not None:
+        print(f"dbecho: {problem}\n\n{_USAGE}", file=sys.stderr)
+        raise SystemExit(2)
+
     if "--version" in sys.argv:
         print(f"dbecho {_version()}")
         return

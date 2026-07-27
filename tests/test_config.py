@@ -1,6 +1,6 @@
 import pytest
 from pathlib import Path
-from dbecho.config import load_config
+from dbecho.config import load_config, find_config
 
 
 def write_toml(tmp_path: Path, content: str) -> Path:
@@ -434,4 +434,89 @@ redact_sensitive = 1
 """,
     )
     with pytest.raises(ValueError, match="must be a boolean"):
+        load_config(p)
+
+
+# --------------------------------------------------------------------------
+# find_config: the documented search order (README/CLAUDE.md) — CWD first,
+# then ~/.config/dbecho/config.toml, then ~/.dbecho.toml.
+# --------------------------------------------------------------------------
+
+
+def _isolate(monkeypatch, cwd, home):
+    monkeypatch.setattr(Path, "cwd", staticmethod(lambda: cwd))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+
+
+def test_find_config_prefers_cwd(tmp_path, monkeypatch):
+    cwd, home = tmp_path / "proj", tmp_path / "home"
+    (cwd).mkdir()
+    (home / ".config" / "dbecho").mkdir(parents=True)
+    local = cwd / "dbecho.toml"
+    local.write_text("")
+    (home / ".config" / "dbecho" / "config.toml").write_text("")
+    _isolate(monkeypatch, cwd, home)
+
+    assert find_config() == local
+
+
+def test_find_config_falls_back_to_xdg_then_dotfile(tmp_path, monkeypatch):
+    cwd, home = tmp_path / "proj", tmp_path / "home"
+    cwd.mkdir()
+    xdg_dir = home / ".config" / "dbecho"
+    xdg_dir.mkdir(parents=True)
+    xdg = xdg_dir / "config.toml"
+    xdg.write_text("")
+    dotfile = home / ".dbecho.toml"
+    dotfile.write_text("")
+    _isolate(monkeypatch, cwd, home)
+
+    assert find_config() == xdg
+
+    xdg.unlink()
+    assert find_config() == dotfile
+
+
+def test_find_config_returns_none_when_nothing_exists(tmp_path, monkeypatch):
+    cwd, home = tmp_path / "proj", tmp_path / "home"
+    cwd.mkdir()
+    home.mkdir()
+    _isolate(monkeypatch, cwd, home)
+
+    assert find_config() is None
+
+
+def test_settings_section_must_be_a_table(tmp_path):
+    p = write_toml(tmp_path, 'settings = "nope"\n')
+    with pytest.raises(ValueError, match=r"\[settings\] must be a table, got str"):
+        load_config(p)
+
+
+def test_databases_section_must_be_a_table(tmp_path):
+    p = write_toml(tmp_path, "databases = 5\n")
+    with pytest.raises(ValueError, match=r"\[databases\] must be a table, got int"):
+        load_config(p)
+
+
+def test_database_entry_must_be_a_table(tmp_path):
+    p = write_toml(tmp_path, 'databases = { db1 = "postgres://localhost/db1" }\n')
+    with pytest.raises(ValueError, match=r"\[databases.db1\] must be a table"):
+        load_config(p)
+
+
+def test_url_must_be_a_non_empty_string(tmp_path):
+    p = write_toml(tmp_path, "[databases.db1]\nurl = 42\n")
+    with pytest.raises(ValueError, match="must be a non-empty string"):
+        load_config(p)
+
+    p = write_toml(tmp_path, '[databases.db1]\nurl = "   "\n')
+    with pytest.raises(ValueError, match="must be a non-empty string"):
+        load_config(p)
+
+
+def test_description_must_be_a_string(tmp_path):
+    p = write_toml(
+        tmp_path, '[databases.db1]\nurl = "postgres://localhost/db1"\ndescription = 7\n'
+    )
+    with pytest.raises(ValueError, match="description must be a string"):
         load_config(p)

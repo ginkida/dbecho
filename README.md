@@ -41,6 +41,13 @@ Claude: [runs schema → query → analyze → trend across 29 tables]
 
 Plus **3 MCP Resources** (schema/summary per database) and **3 MCP Prompts** (guided exploration, cross-database comparison, data quality audit).
 
+**Partitioned tables** are reported as the parent, not as a pile of children:
+`schema`, `find`, `summary` and `erd` hide partition children and mark the parent
+`[partitioned]`, with row estimates and size summed across the whole partition
+tree (a parent stores nothing itself, so the raw catalog would show the biggest
+table in the database as empty). Query the parent and let PostgreSQL prune;
+`describe <child>` still works if you name a partition explicitly.
+
 ## Why dbecho?
 
 **The problem:** You have PostgreSQL databases across projects. Getting answers means context-switching to psql, pgAdmin, or a BI tool, writing SQL, formatting results, then bringing insights back to your conversation.
@@ -109,7 +116,7 @@ cd dbecho
 pip install .
 ```
 
-Requires Python 3.10+.
+Requires Python 3.10+ and PostgreSQL 12 or newer.
 
 ### 2. Configure
 
@@ -155,11 +162,16 @@ Verify the config and connectivity before wiring up your MCP client:
 ```bash
 dbecho --check     # validate config + ping every database
 dbecho --version   # print "dbecho <version>"
+dbecho --help      # usage and flags
 ```
 
 `--check` prints a `[OK]`/`[FAIL] <name>: …` line per database and exits 0 only
 when every database responds (non-zero otherwise), so it drops straight into a
 CI or healthcheck script.
+
+Exit codes: `0` success, `1` config or startup failure (also a failed `--check`),
+`2` usage error. Unrecognised arguments are rejected rather than ignored, so a
+typo like `--verison` never starts a server that quietly did nothing.
 
 ### 3. Connect to your MCP client
 
@@ -222,7 +234,8 @@ dbecho is designed to be safe to point at any database, including production:
 - **Blocked functions.** Filesystem, large-object, `dblink`, and `set_config` functions are rejected even though the transaction is read-only — they are exfiltration/escape vectors.
 - **SQL injection prevention.** All table/column identifiers use `psycopg.sql.Identifier()` parameterization. User input is validated against `^[a-zA-Z_][a-zA-Z0-9_]*\Z` (`\Z`, not `$`, so a trailing newline can't sneak past). The one identifier-shaped value placed outside `Identifier()` is the per-database `schema` config option — it is embedded in the connection's `search_path` — and it is validated against the same shape (lowercase-only) at config load, before any connection exists.
 - **Query timeout.** Default 30 seconds, enforced as one shared budget across multi-query tools via `statement_timeout`, with session-level timeout backstops on every connection.
-- **Row limit.** Default 500 rows per query. Prevents the agent from pulling entire tables into context. Full-table profiling (`analyze`/`anomalies`) additionally refuses tables above `max_profile_rows`.
+- **Row limit.** Default 500 rows per query. Prevents the agent from pulling entire tables into context. Full-table profiling (`analyze`/`anomalies`) additionally refuses tables above `max_profile_rows` — exact stats over 50M rows cannot be made cheap, so that one is a refusal, and the message names the setting that raises it.
+- **Column cap.** `analyze`/`anomalies` probe at most 80 columns (each costs its own queries). A wider table is profiled partially rather than refused, and the result always states how many columns were skipped and names them — a partial profile that looks complete would be worse than an error.
 - **Sensitive-column redaction.** Values of columns that look like secrets (`password`, `token`, `api_key`, `secret`, ...) are replaced with `<redacted>` in `query`/`sample`/`analyze` output (default on; `redact_sensitive = false` to disable). This is name-based harm reduction, **not** a hermetic control — `query` is an open read channel by design.
 - **Sanitized errors.** Connection failures are reported to the agent as coarse categories (`authentication failed`, `connection refused`, ...); full details go to the server log only, so hostnames/usernames never leak into the conversation.
 - **Local only.** No network calls, no telemetry, no cloud. Data stays on your machine.
@@ -234,11 +247,11 @@ For production databases, the strongest setup is still a **least-privilege role*
 ```
 src/dbecho/
   config.py   TOML config loading, env var expansion, validation
-  db.py       DatabaseManager: connections, schema cache, queries, stats, trends, anomalies
+  db.py       DatabaseManager: connections, SQL validation, schema, queries, stats, trends, anomalies
   server.py   FastMCP server: 14 tools, 3 resources, 3 prompts
 ```
 
-~2000 lines of Python total. No framework beyond `mcp` and `psycopg`.
+~2700 lines of Python total. No framework beyond `mcp` and `psycopg`.
 
 ## Development
 
@@ -250,6 +263,18 @@ pytest -v
 ```
 
 Tests are fully mocked, no PostgreSQL instance needed. CI runs on Python 3.10-3.13.
+
+```bash
+coverage run --branch -m pytest -q
+coverage report --show-missing --include='src/*'
+```
+
+Because the suite never touches a server, catalog-level SQL (partition trees,
+`pg_stat_user_tables` joins, index introspection) should be checked by hand
+against a throwaway instance before it lands — e.g.
+`docker run --rm -d -e POSTGRES_HOST_AUTH_METHOD=trust -p 55434:5432 postgres:16`,
+then point a scratch `dbecho.toml` at it. Mocks pin the plumbing; only a real
+server tells you the query is right.
 
 ## License
 

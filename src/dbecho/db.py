@@ -357,6 +357,10 @@ class TableInfo:
     columns: list[ColumnInfo]
     row_count: int = 0
     size_bytes: int = 0
+    # True for a declarative-partitioning parent (relkind 'p'). Its row_count
+    # and size_bytes are summed over the whole partition tree, since the parent
+    # itself stores nothing.
+    is_partitioned: bool = False
 
 
 @dataclass
@@ -382,7 +386,11 @@ class DatabaseManager:
             db.name: db for db in config.databases
         }
         self._settings = config.settings
-        self._schema_cache: dict[str, list[TableInfo]] = {}
+        # No schema caching, deliberately: schemas change while an agent is
+        # mid-conversation (migrations, new columns) and a stale schema is a
+        # silent wrong-answer generator, not a slow one. Every get_schema()
+        # re-reads. Only the "was the table list capped" flag is remembered,
+        # so the tool layer can annotate the listing it just returned.
         self._schema_truncated: dict[str, bool] = {}
 
     @property
@@ -616,27 +624,44 @@ class DatabaseManager:
                     truncated=truncated,
                 )
 
-    def get_schema(self, database: str, use_cache: bool = False) -> list[TableInfo]:
-        if use_cache and database in self._schema_cache:
-            return list(self._schema_cache[database])
-
+    def get_schema(self, database: str) -> list[TableInfo]:
         db = self.get_database(database)
 
         with self._connect(db) as conn:
             with conn.cursor() as cur:
                 deadline = self._new_deadline()
-                # Tables with sizes and row counts
+                # Tables with sizes and row counts. Partition children are
+                # excluded (`NOT c.relispartition`): a monthly-partitioned
+                # table would otherwise bury the schema in near-identical
+                # entries, and the parent — the thing you actually query —
+                # reports 0 rows / 0 bytes because it stores nothing itself.
+                # For a parent (relkind 'p') the stats are summed over the
+                # leaves of its partition tree instead. Children stay
+                # describable by name; they are only hidden from listings.
                 self._execute(
                     cur,
                     """
                     SELECT
                         t.table_name,
-                        obj_description((quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass) AS comment,
-                        COALESCE(s.n_live_tup, 0) AS row_count,
-                        COALESCE(pg_total_relation_size((quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass), 0) AS size_bytes
+                        obj_description(c.oid) AS comment,
+                        CASE WHEN c.relkind = 'p' THEN COALESCE(p.row_count, 0)
+                             ELSE COALESCE(s.n_live_tup, 0) END AS row_count,
+                        CASE WHEN c.relkind = 'p' THEN COALESCE(p.size_bytes, 0)
+                             ELSE COALESCE(pg_total_relation_size(c.oid), 0) END AS size_bytes,
+                        c.relkind = 'p' AS is_partitioned
                     FROM information_schema.tables t
-                    LEFT JOIN pg_stat_user_tables s ON s.relname = t.table_name AND s.schemaname = t.table_schema
+                    JOIN pg_namespace n ON n.nspname = t.table_schema
+                    JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = t.table_name
+                    LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+                    LEFT JOIN LATERAL (
+                        SELECT sum(pg_total_relation_size(leaf.relid))::bigint AS size_bytes,
+                               sum(COALESCE(ls.n_live_tup, 0))::bigint AS row_count
+                        FROM pg_partition_tree(c.oid) leaf
+                        LEFT JOIN pg_stat_user_tables ls ON ls.relid = leaf.relid
+                        WHERE leaf.isleaf
+                    ) p ON c.relkind = 'p'
                     WHERE t.table_schema = %s AND t.table_type = 'BASE TABLE'
+                        AND NOT c.relispartition
                     ORDER BY t.table_name
                     LIMIT %s
                 """,
@@ -699,7 +724,7 @@ class DatabaseManager:
             )
 
         tables = []
-        for tname, comment, row_count, size_bytes in table_rows:
+        for tname, comment, row_count, size_bytes, is_partitioned in table_rows:
             tables.append(
                 TableInfo(
                     name=tname,
@@ -707,11 +732,10 @@ class DatabaseManager:
                     columns=columns_by_table.get(tname, []),
                     row_count=row_count,
                     size_bytes=size_bytes,
+                    is_partitioned=is_partitioned,
                 )
             )
 
-        if use_cache:
-            self._schema_cache[database] = list(tables)
         return tables
 
     def schema_truncated(self, database: str) -> bool:
@@ -761,8 +785,32 @@ class DatabaseManager:
         if row_count > limit:
             raise ValueError(
                 f"Table '{table}' has {row_count:,} rows "
-                f"(max {limit:,} for full profiling); use a targeted query instead"
+                f"(max {limit:,} for full profiling — raise [settings].max_profile_rows "
+                f"to allow it); meanwhile use sample for a preview, trend for a time "
+                f"series, or query for specific columns"
             )
+
+    @staticmethod
+    def _cap_profile_columns(
+        table: str, columns: list[tuple]
+    ) -> tuple[list[tuple], list[str]]:
+        """Cap a very wide table instead of refusing to profile it.
+
+        Every column costs its own probe queries, so the number profiled must
+        stay bounded — but a 300-column table used to raise, leaving the agent
+        with nothing. Profile the first N in ordinal order and hand back the
+        names that were left out so the omission can be stated, never silent.
+        """
+        if len(columns) <= _MAX_COLUMNS_FOR_STATS:
+            return columns, []
+        omitted = [c[0] for c in columns[_MAX_COLUMNS_FOR_STATS:]]
+        logger.info(
+            "Profiling '%s': capped at %d of %d columns",
+            table,
+            _MAX_COLUMNS_FOR_STATS,
+            len(columns),
+        )
+        return columns[:_MAX_COLUMNS_FOR_STATS], omitted
 
     def _column_stats(
         self,
@@ -872,19 +920,18 @@ class DatabaseManager:
                     deadline=deadline,
                 )
                 columns = cur.fetchall()
-
-                if len(columns) > _MAX_COLUMNS_FOR_STATS:
-                    raise ValueError(
-                        f"Table '{table}' has {len(columns)} columns "
-                        f"(max {_MAX_COLUMNS_FOR_STATS} for stats)"
-                    )
+                total_columns = len(columns)
+                columns, omitted_columns = self._cap_profile_columns(table, columns)
 
                 stats = {
                     "table": table,
                     "database": database,
                     "row_count": row_count,
+                    "column_count": total_columns,
                     "columns": {},
                 }
+                if omitted_columns:
+                    stats["omitted_columns"] = omitted_columns
 
                 skipped: list[str] = []
                 for idx, (col_name, data_type) in enumerate(columns):
@@ -1232,12 +1279,8 @@ class DatabaseManager:
                     deadline=deadline,
                 )
                 columns = cur.fetchall()
-
-                if len(columns) > _MAX_COLUMNS_FOR_STATS:
-                    raise ValueError(
-                        f"Table '{table}' has {len(columns)} columns "
-                        f"(max {_MAX_COLUMNS_FOR_STATS} for anomaly detection)"
-                    )
+                total_columns = len(columns)
+                columns, omitted_columns = self._cap_profile_columns(table, columns)
 
                 for idx, (col_name, data_type) in enumerate(columns):
                     try:
@@ -1267,10 +1310,13 @@ class DatabaseManager:
             "table": table,
             "database": database,
             "row_count": row_count,
+            "column_count": total_columns,
             "anomalies": anomalies,
         }
         if skipped:
             result["skipped_columns"] = skipped
+        if omitted_columns:
+            result["omitted_columns"] = omitted_columns
         return result
 
     def get_table_schema(self, database: str, table: str) -> TableInfo:
@@ -1284,15 +1330,31 @@ class DatabaseManager:
                 deadline = self._new_deadline()
                 self._ensure_table_exists(cur, db, table, deadline=deadline)
 
+                # Same partition-tree aggregation as get_schema(): a partitioned
+                # parent stores nothing itself, so summing its leaves is the
+                # only honest row/size answer. A partition child named
+                # explicitly is still described normally.
                 self._execute(
                     cur,
                     """
                     SELECT
-                        obj_description((quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass) AS comment,
-                        COALESCE(s.n_live_tup, 0) AS row_count,
-                        COALESCE(pg_total_relation_size((quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass), 0) AS size_bytes
+                        obj_description(c.oid) AS comment,
+                        CASE WHEN c.relkind = 'p' THEN COALESCE(p.row_count, 0)
+                             ELSE COALESCE(s.n_live_tup, 0) END AS row_count,
+                        CASE WHEN c.relkind = 'p' THEN COALESCE(p.size_bytes, 0)
+                             ELSE COALESCE(pg_total_relation_size(c.oid), 0) END AS size_bytes,
+                        c.relkind = 'p' AS is_partitioned
                     FROM information_schema.tables t
-                    LEFT JOIN pg_stat_user_tables s ON s.relname = t.table_name AND s.schemaname = t.table_schema
+                    JOIN pg_namespace n ON n.nspname = t.table_schema
+                    JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = t.table_name
+                    LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+                    LEFT JOIN LATERAL (
+                        SELECT sum(pg_total_relation_size(leaf.relid))::bigint AS size_bytes,
+                               sum(COALESCE(ls.n_live_tup, 0))::bigint AS row_count
+                        FROM pg_partition_tree(c.oid) leaf
+                        LEFT JOIN pg_stat_user_tables ls ON ls.relid = leaf.relid
+                        WHERE leaf.isleaf
+                    ) p ON c.relkind = 'p'
                     WHERE t.table_schema = %s AND t.table_name = %s
                         AND t.table_type = 'BASE TABLE'
                 """,
@@ -1300,7 +1362,9 @@ class DatabaseManager:
                     deadline=deadline,
                 )
                 row = cur.fetchone()
-                comment, row_count, size_bytes = row if row else (None, 0, 0)
+                comment, row_count, size_bytes, is_partitioned = (
+                    row if row else (None, 0, 0, False)
+                )
 
                 self._execute(
                     cur,
@@ -1346,6 +1410,7 @@ class DatabaseManager:
             columns=columns,
             row_count=row_count,
             size_bytes=size_bytes,
+            is_partitioned=is_partitioned,
         )
 
     def get_indexes(self, database: str, table: str | None = None) -> list[dict]:
@@ -1414,14 +1479,20 @@ class DatabaseManager:
         with self._connect(db) as conn:
             with conn.cursor() as cur:
                 deadline = self._new_deadline()
+                # Partition children are excluded to match get_schema(): on a
+                # monthly-partitioned table every child matches the same
+                # pattern and would crowd out real hits under the result cap.
                 self._execute(
                     cur,
                     """
-                    SELECT table_name
-                    FROM information_schema.tables
-                    WHERE table_schema = %s AND table_type = 'BASE TABLE'
-                        AND table_name ILIKE %s
-                    ORDER BY table_name
+                    SELECT t.table_name
+                    FROM information_schema.tables t
+                    JOIN pg_namespace n ON n.nspname = t.table_schema
+                    JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = t.table_name
+                    WHERE t.table_schema = %s AND t.table_type = 'BASE TABLE'
+                        AND NOT c.relispartition
+                        AND t.table_name ILIKE %s
+                    ORDER BY t.table_name
                     LIMIT %s
                 """,
                     (db.schema, like, _MAX_FIND_RESULTS + 1),
@@ -1434,14 +1505,17 @@ class DatabaseManager:
                 self._execute(
                     cur,
                     """
-                    SELECT c.table_name, c.column_name, c.data_type
-                    FROM information_schema.columns c
+                    SELECT col.table_name, col.column_name, col.data_type
+                    FROM information_schema.columns col
                     JOIN information_schema.tables t
-                        ON t.table_schema = c.table_schema
-                        AND t.table_name = c.table_name
-                    WHERE c.table_schema = %s AND t.table_type = 'BASE TABLE'
-                        AND c.column_name ILIKE %s
-                    ORDER BY c.table_name, c.ordinal_position
+                        ON t.table_schema = col.table_schema
+                        AND t.table_name = col.table_name
+                    JOIN pg_namespace n ON n.nspname = t.table_schema
+                    JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = t.table_name
+                    WHERE col.table_schema = %s AND t.table_type = 'BASE TABLE'
+                        AND NOT c.relispartition
+                        AND col.column_name ILIKE %s
+                    ORDER BY col.table_name, col.ordinal_position
                     LIMIT %s
                 """,
                     (db.schema, like, _MAX_FIND_RESULTS + 1),

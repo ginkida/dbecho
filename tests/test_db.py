@@ -11,6 +11,7 @@ from dbecho.db import (
     _escape_like,
     _is_sensitive_column,
     _safe_conn_error,
+    _strip_strings_and_comments,
 )
 from dbecho.config import Config, DatabaseConfig, Settings
 
@@ -452,12 +453,12 @@ class TestQuery:
 
 
 class TestGetSchema:
-    def test_schema_with_cache(self):
+    def test_schema_assembles_tables_columns_and_pks(self):
         cur = MagicMock()
         cur.fetchall = MagicMock(
             side_effect=[
                 # table_rows
-                [("users", "User accounts", 100, 8192)],
+                [("users", "User accounts", 100, 8192, False)],
                 # col_rows
                 [("users", "id", "integer", "NO", "nextval('users_id_seq')")],
                 # pk_set
@@ -467,7 +468,7 @@ class TestGetSchema:
 
         with mock_connection(cur):
             mgr = make_manager()
-            tables = mgr.get_schema("test", use_cache=True)
+            tables = mgr.get_schema("test")
 
         assert len(tables) == 1
         assert tables[0].name == "users"
@@ -478,24 +479,16 @@ class TestGetSchema:
         assert tables[0].columns[0].name == "id"
         assert tables[0].columns[0].is_primary_key
 
-        # Second call uses cache (no new DB calls) but returns a fresh copy
-        # so callers can't corrupt the cache by mutating the list.
-        tables2 = mgr.get_schema("test", use_cache=True)
-        assert tables2 is not tables
-        assert tables2 == tables
-        tables.append("INJECTED")
-        tables3 = mgr.get_schema("test", use_cache=True)
-        assert "INJECTED" not in tables3
-
-    def test_schema_default_is_fresh(self):
+    def test_schema_is_always_re_read(self):
         cur = MagicMock()
         cur.fetchall = MagicMock(
             side_effect=[
-                [("posts", None, 50, 4096)],
+                [("posts", None, 50, 4096, False)],
                 [("posts", "title", "text", "NO", None)],
                 [],
-                # Second call (no cache)
-                [("posts", None, 55, 4096)],
+                # Second call re-reads: no cache means a mid-conversation
+                # migration can never be served from stale state.
+                [("posts", None, 55, 4096, False)],
                 [("posts", "title", "text", "NO", None)],
                 [],
             ]
@@ -1126,7 +1119,7 @@ class TestSchemaScoping:
 
     def test_describe_filters_by_schema(self):
         cur = MagicMock()
-        cur.fetchone = MagicMock(side_effect=[(1,), (None, 0, 0)])
+        cur.fetchone = MagicMock(side_effect=[(1,), (None, 0, 0, False)])
         cur.fetchall = MagicMock(return_value=[])
 
         with mock_connection(cur):
@@ -1400,7 +1393,7 @@ class TestGetTableSchema:
         cur.fetchone = MagicMock(
             side_effect=[
                 (1,),  # table exists
-                ("User accounts", 100, 8192),  # comment, rows, size
+                ("User accounts", 100, 8192, False),  # comment, rows, size, partitioned
             ]
         )
         cur.fetchall = MagicMock(
@@ -1654,3 +1647,525 @@ class TestSafeConnError:
         msg = _safe_conn_error(Exception("weird ssl thing at host 10.1.2.3"))
         assert msg == "connection error"
         assert "10.1.2.3" not in msg
+
+
+class TestPartitionedTables:
+    """Partition children are hidden from listings and a parent's stats are
+    summed across its tree — the parent itself stores nothing, so the raw
+    catalog reports the biggest table in a partitioned database as empty.
+    Semantics were validated against a real PostgreSQL 16 (multi-level tree,
+    empty parent); these tests pin the plumbing and the SQL guards.
+    """
+
+    def test_schema_marks_parent_and_keeps_aggregate(self):
+        cur = MagicMock()
+        cur.fetchall = MagicMock(
+            side_effect=[
+                [
+                    ("events", "partitioned parent", 194_727, 112_197_632, True),
+                    ("projects", None, 6, 8192, False),
+                ],
+                [("events", "occurred_at", "timestamp with time zone", "NO", None)],
+                [],
+            ]
+        )
+
+        with mock_connection(cur):
+            mgr = make_manager()
+            tables = mgr.get_schema("test")
+
+        by_name = {t.name: t for t in tables}
+        assert by_name["events"].is_partitioned is True
+        assert by_name["events"].row_count == 194_727
+        assert by_name["events"].size_bytes == 112_197_632
+        assert by_name["projects"].is_partitioned is False
+
+    def test_schema_query_hides_children_and_sums_tree(self):
+        cur = MagicMock()
+        cur.fetchall = MagicMock(side_effect=[[], [], []])
+
+        with mock_connection(cur):
+            make_manager().get_schema("test")
+
+        # execute() also emits SET LOCAL statement_timeout — keep only real SQL.
+        metadata_sql = [
+            c.args[0]
+            for c in cur.execute.call_args_list
+            if isinstance(c.args[0], str) and "information_schema" in c.args[0]
+        ]
+        table_sql = metadata_sql[0]
+        assert "NOT c.relispartition" in table_sql
+        assert "pg_partition_tree" in table_sql
+        assert "leaf.isleaf" in table_sql
+
+    def test_describe_reports_partitioned_parent(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(
+            side_effect=[(1,), ("event store", 194_727, 112_197_632, True)]
+        )
+        cur.fetchall = MagicMock(side_effect=[[], []])
+
+        with mock_connection(cur):
+            info = make_manager().get_table_schema("test", "events")
+
+        assert info.is_partitioned is True
+        assert info.row_count == 194_727
+
+    def test_describe_of_a_child_still_works(self):
+        # Children are hidden from listings, not made unreachable: naming one
+        # explicitly must still describe it (relkind 'r' -> not partitioned).
+        cur = MagicMock()
+        cur.fetchone = MagicMock(side_effect=[(1,), (None, 12_000, 8_192, False)])
+        cur.fetchall = MagicMock(side_effect=[[], []])
+
+        with mock_connection(cur):
+            info = make_manager().get_table_schema("test", "events_2026_06")
+
+        assert info.name == "events_2026_06"
+        assert info.is_partitioned is False
+        assert info.row_count == 12_000
+
+    def test_find_queries_exclude_children(self):
+        cur = MagicMock()
+        cur.fetchall = MagicMock(side_effect=[[], []])
+
+        with mock_connection(cur):
+            make_manager().find_objects("test", "occurred")
+
+        table_sql, column_sql = [
+            c.args[0]
+            for c in cur.execute.call_args_list
+            if isinstance(c.args[0], str) and "information_schema" in c.args[0]
+        ][:2]
+        assert "NOT c.relispartition" in table_sql
+        assert "NOT c.relispartition" in column_sql
+
+    def test_partition_queries_stay_schema_scoped(self):
+        # The pg_catalog joins must not become a way to leak other schemas.
+        cur = MagicMock()
+        cur.fetchall = MagicMock(side_effect=[[], [], []])
+
+        with mock_connection(cur):
+            make_manager(schema="analytics").get_schema("test")
+
+        for call in cur.execute.call_args_list:
+            sql = call.args[0]
+            if isinstance(sql, str) and "information_schema" in sql:
+                assert "'public'" not in sql
+                assert call.args[1][0] == "analytics"
+
+
+class TestStripStringsAndComments:
+    """The stripper is what `_WRITE_RE` and `_BLOCKED_FUNC_RE` actually see, so
+    its edge cases are security-relevant in both directions: swallowing too
+    little lets a keyword hide inside a literal (false negative on data),
+    swallowing too much would blind the denylist. Behaviour pinned as observed.
+    """
+
+    def test_escaped_single_quote(self):
+        assert _strip_strings_and_comments("SELECT 'it''s fine' AS x") == (
+            "SELECT   AS x"
+        )
+
+    def test_escaped_double_quote_in_identifier(self):
+        assert _strip_strings_and_comments('SELECT "weird""col" FROM t') == (
+            "SELECT   FROM t"
+        )
+
+    def test_dollar_quoted_block_with_tag(self):
+        # A write keyword inside a dollar-quoted literal is data, not a statement.
+        assert _strip_strings_and_comments(
+            "SELECT $tag$ DELETE FROM users $tag$ AS payload"
+        ) == ("SELECT   AS payload")
+
+    def test_anonymous_dollar_quote(self):
+        assert _strip_strings_and_comments("SELECT $$ DROP TABLE t $$ AS s") == (
+            "SELECT   AS s"
+        )
+
+    def test_positional_parameters_survive(self):
+        # $1 is a placeholder, not a quote tag — treating it as one would
+        # swallow the rest of the query and diverge from the server's parsing.
+        sql = "SELECT * FROM t WHERE id = $1 AND x = $2"
+        assert _strip_strings_and_comments(sql) == sql
+
+    def test_dollar_sign_without_closing_tag_is_left_alone(self):
+        # Not a dollar quote, so a following keyword stays visible (conservative).
+        assert "DELETE" in _strip_strings_and_comments("SELECT $notatag DELETE")
+
+    def test_unterminated_quotes_swallow_the_remainder(self):
+        for sql in ("SELECT 'oops", 'SELECT "oops', "SELECT $tag$ oops"):
+            assert _strip_strings_and_comments(sql).strip() == "SELECT"
+
+    def test_line_and_block_comments(self):
+        assert _strip_strings_and_comments("SELECT 1 -- DELETE FROM users").strip() == (
+            "SELECT 1"
+        )
+        assert _strip_strings_and_comments("SELECT /* DELETE */ 1") == "SELECT   1"
+
+    def test_nested_block_comments(self):
+        assert _strip_strings_and_comments(
+            "SELECT /* nested /* inner */ still */ 1"
+        ) == ("SELECT   1")
+
+
+class TestValidateSqlStringHandling:
+    def test_comment_only_query_is_empty(self):
+        for sql in ("-- just a comment", "/* just a comment */"):
+            with pytest.raises(ValueError, match="Empty query"):
+                DatabaseManager.validate_sql(sql)
+
+    def test_semicolon_inside_a_literal_is_not_multi_statement(self):
+        assert DatabaseManager.validate_sql("SELECT ';' AS semi")
+
+    def test_write_keyword_inside_a_literal_is_allowed(self):
+        # Otherwise `SELECT 'DELETE'` — legitimate data — would be refused.
+        assert DatabaseManager.validate_sql("SELECT 'DELETE FROM users' AS label")
+        assert DatabaseManager.validate_sql("SELECT 1 -- DELETE FROM users")
+        assert DatabaseManager.validate_sql(
+            "SELECT $tag$ DROP TABLE users $tag$ AS payload"
+        )
+
+    def test_blocked_function_inside_a_comment_is_allowed(self):
+        assert DatabaseManager.validate_sql("SELECT 1 /* pg_read_file( */")
+
+    def test_write_keyword_after_a_bare_dollar_is_still_rejected(self):
+        with pytest.raises(ValueError, match="Data-modifying"):
+            DatabaseManager.validate_sql("SELECT $notatag DELETE")
+
+    def test_explain_option_list_is_parsed(self):
+        # ANALYZE inside the paren option list still guards the body...
+        with pytest.raises(ValueError, match="EXPLAIN ANALYZE"):
+            DatabaseManager.validate_sql("EXPLAIN (ANALYZE, BUFFERS) DELETE FROM t")
+        # ...while a plan-only option list is fine.
+        assert DatabaseManager.validate_sql("EXPLAIN (FORMAT JSON) SELECT 1")
+
+
+class TestSavepointCleanupFailure:
+    def test_original_probe_error_survives_a_failed_rollback(self):
+        # A dead connection can make ROLLBACK TO SAVEPOINT fail too; that must
+        # not replace the error the caller is trying to handle.
+        cur = MagicMock()
+        calls = []
+
+        def execute(query, *args, **kwargs):
+            text = str(query)
+            calls.append(text)
+            if "ROLLBACK TO SAVEPOINT" in text:
+                raise RuntimeError("connection is dead")
+
+        cur.execute = MagicMock(side_effect=execute)
+        mgr = make_manager()
+
+        with pytest.raises(ValueError, match="probe blew up"):
+            with mgr._savepoint(cur, "probe"):
+                raise ValueError("probe blew up")
+
+        assert any("SAVEPOINT" in c for c in calls)
+
+    def test_release_runs_on_success(self):
+        cur = MagicMock()
+        mgr = make_manager()
+        with mgr._savepoint(cur, "probe"):
+            pass
+        assert any(
+            "RELEASE SAVEPOINT" in str(c.args[0]) for c in cur.execute.call_args_list
+        )
+
+
+class TestSchemaTableCap:
+    def test_over_cap_is_truncated_and_flagged(self):
+        from dbecho.db import _MAX_SCHEMA_TABLES
+
+        over = [(f"t{i}", None, 0, 0, False) for i in range(_MAX_SCHEMA_TABLES + 5)]
+        cur = MagicMock()
+        cur.fetchall = MagicMock(side_effect=[over, [], []])
+
+        with mock_connection(cur):
+            mgr = make_manager()
+            tables = mgr.get_schema("test")
+
+        assert len(tables) == _MAX_SCHEMA_TABLES
+        assert mgr.schema_truncated("test") is True
+
+    def test_under_cap_is_not_flagged(self):
+        cur = MagicMock()
+        cur.fetchall = MagicMock(side_effect=[[("t", None, 0, 0, False)], [], []])
+
+        with mock_connection(cur):
+            mgr = make_manager()
+            mgr.get_schema("test")
+
+        assert mgr.schema_truncated("test") is False
+
+    def test_unknown_database_is_not_reported_as_truncated(self):
+        assert make_manager().schema_truncated("never_fetched") is False
+
+
+class TestAnomalyDetectors:
+    def test_numeric_outliers_via_iqr(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(
+            side_effect=[
+                (1,),  # table exists
+                (100,),  # row count
+                (0,),  # nulls
+                (60,),  # distinct (> 4 so the IQR probe runs)
+                (10, 30),  # q1, q3 -> iqr 20 -> bounds -20..60
+                (3,),  # outliers outside the bounds
+            ]
+        )
+        cur.fetchall = MagicMock(side_effect=[[("amount", "integer")]])
+
+        with mock_connection(cur):
+            result = make_manager().find_anomalies("test", "orders")
+
+        outliers = [a for a in result["anomalies"] if a["type"] == "outliers"]
+        assert outliers and outliers[0]["column"] == "amount"
+        assert "IQR: -20.0..60.0" in outliers[0]["detail"]
+
+    def test_zero_iqr_skips_the_outlier_probe(self):
+        # q1 == q3 means no spread; dividing the world at 1.5*0 would flag
+        # every row that isn't the median.
+        cur = MagicMock()
+        cur.fetchone = MagicMock(
+            side_effect=[(1,), (100,), (0,), (60,), (5, 5)],
+        )
+        cur.fetchall = MagicMock(side_effect=[[("amount", "integer")]])
+
+        with mock_connection(cur):
+            result = make_manager().find_anomalies("test", "orders")
+
+        assert not [a for a in result["anomalies"] if a["type"] == "outliers"]
+
+    def test_null_percentiles_skip_the_outlier_probe(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(side_effect=[(1,), (100,), (0,), (60,), (None, None)])
+        cur.fetchall = MagicMock(side_effect=[[("amount", "numeric")]])
+
+        with mock_connection(cur):
+            result = make_manager().find_anomalies("test", "orders")
+
+        assert not [a for a in result["anomalies"] if a["type"] == "outliers"]
+
+    def test_future_dates_use_the_matching_now_per_type(self):
+        # NOW() is a timestamptz; comparing a date or timestamp-without-tz
+        # column against it is session-timezone dependent, hence the mapping.
+        expected = {
+            "date": "CURRENT_DATE",
+            "timestamp without time zone": "LOCALTIMESTAMP",
+            "timestamp with time zone": "NOW()",
+        }
+        for data_type, now_expr in expected.items():
+            cur = MagicMock()
+            cur.fetchone = MagicMock(side_effect=[(1,), (100,), (0,), (50,), (7,)])
+            cur.fetchall = MagicMock(side_effect=[[("created_at", data_type)]])
+
+            with mock_connection(cur):
+                result = make_manager().find_anomalies("test", "events")
+
+            future = [a for a in result["anomalies"] if a["type"] == "future_dates"]
+            assert future, data_type
+            assert "7 rows with dates in the future" in future[0]["detail"]
+            assert any(
+                now_expr in str(c.args[0]) for c in cur.execute.call_args_list
+            ), data_type
+
+    def test_no_future_probe_for_non_temporal_types(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(side_effect=[(1,), (100,), (0,), (50,)])
+        cur.fetchall = MagicMock(side_effect=[[("name", "text")]])
+
+        with mock_connection(cur):
+            result = make_manager().find_anomalies("test", "users")
+
+        assert not [a for a in result["anomalies"] if a["type"] == "future_dates"]
+
+
+class TestColumnStatsBranches:
+    def test_temporal_column_reports_a_range_not_an_average(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(
+            side_effect=[
+                (1,),  # table exists
+                (100,),  # row count
+                (0,),  # nulls
+                (90,),  # distinct
+                ("2024-01-01", "2026-07-01"),  # MIN/MAX (no AVG for dates)
+            ]
+        )
+        cur.fetchall = MagicMock(side_effect=[[("created_at", "date")]])
+
+        with mock_connection(cur):
+            stats = make_manager().get_table_stats("test", "posts")
+
+        col = stats["columns"]["created_at"]
+        assert col["min"] == "2024-01-01" and col["max"] == "2026-07-01"
+        assert "avg" not in col
+
+    def test_null_temporal_bounds_stay_none(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(side_effect=[(1,), (100,), (100,), (0,), (None, None)])
+        # information_schema spells it out in full; the short "timestamp" form
+        # never reaches here, which is why TEMPORAL_TYPES holds the long names.
+        cur.fetchall = MagicMock(
+            side_effect=[[("deleted_at", "timestamp without time zone")]]
+        )
+
+        with mock_connection(cur):
+            stats = make_manager().get_table_stats("test", "posts")
+
+        col = stats["columns"]["deleted_at"]
+        assert col["min"] is None and col["max"] is None
+
+    def test_low_cardinality_text_gets_top_values(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(side_effect=[(1,), (100,), (0,), (2,)])
+        cur.fetchall = MagicMock(
+            side_effect=[
+                [("lang", "text")],
+                [("ru", 70), ("en", 30)],  # top values
+            ]
+        )
+
+        with mock_connection(cur):
+            stats = make_manager().get_table_stats("test", "posts")
+
+        assert stats["columns"]["lang"]["top_values"] == [
+            {"value": "ru", "count": 70, "pct": 70.0},
+            {"value": "en", "count": 30, "pct": 30.0},
+        ]
+
+    def test_high_cardinality_text_skips_top_values(self):
+        # Listing the top of 5000 distinct free-text values is noise, and the
+        # GROUP BY would scan the whole table for nothing.
+        cur = MagicMock()
+        cur.fetchone = MagicMock(side_effect=[(1,), (100,), (0,), (5000,)])
+        cur.fetchall = MagicMock(side_effect=[[("body", "text")]])
+
+        with mock_connection(cur):
+            stats = make_manager().get_table_stats("test", "posts")
+
+        assert "top_values" not in stats["columns"]["body"]
+
+    def test_empty_table_skips_top_values(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(side_effect=[(1,), (0,)])
+        cur.fetchall = MagicMock(side_effect=[[("lang", "text")]])
+
+        with mock_connection(cur):
+            stats = make_manager().get_table_stats("test", "posts")
+
+        assert stats["row_count"] == 0
+        assert stats["columns"] == {}
+
+    def test_sensitive_top_values_are_redacted(self):
+        cur = MagicMock()
+        cur.fetchone = MagicMock(side_effect=[(1,), (100,), (0,), (3,)])
+        cur.fetchall = MagicMock(
+            side_effect=[
+                [("api_key", "text")],
+                [("sk-live-abc", 60), ("sk-live-def", 40)],
+            ]
+        )
+
+        with mock_connection(cur):
+            stats = make_manager().get_table_stats("test", "tokens")
+
+        values = [v["value"] for v in stats["columns"]["api_key"]["top_values"]]
+        assert values == ["<redacted>", "<redacted>"]
+        assert all("sk-live" not in str(v) for v in values)
+
+
+class TestWideTableProfiling:
+    """A table wider than the probe cap used to raise, leaving the agent with
+    nothing. It is now capped: the first N columns are profiled, the rest are
+    named back so the tool layer can state the omission. The cost ceiling is
+    unchanged — still at most _MAX_COLUMNS_FOR_STATS probed columns.
+    """
+
+    def _wide_columns(self, n):
+        # jsonb: no numeric/temporal/text branch, so exactly two probes each.
+        return [(f"c{i}", "jsonb") for i in range(n)]
+
+    def test_analyze_profiles_the_cap_and_names_the_rest(self):
+        from dbecho.db import _MAX_COLUMNS_FOR_STATS
+
+        total = _MAX_COLUMNS_FOR_STATS + 10
+        cur = MagicMock()
+        cur.fetchone = MagicMock(
+            side_effect=[(1,), (100,)] + [(0,), (5,)] * _MAX_COLUMNS_FOR_STATS
+        )
+        cur.fetchall = MagicMock(side_effect=[self._wide_columns(total)])
+
+        with mock_connection(cur):
+            stats = make_manager().get_table_stats("test", "wide")
+
+        assert len(stats["columns"]) == _MAX_COLUMNS_FOR_STATS
+        assert stats["column_count"] == total
+        assert stats["omitted_columns"] == [
+            f"c{i}" for i in range(_MAX_COLUMNS_FOR_STATS, total)
+        ]
+
+    def test_anomalies_checks_the_cap_and_names_the_rest(self):
+        from dbecho.db import _MAX_COLUMNS_FOR_STATS
+
+        total = _MAX_COLUMNS_FOR_STATS + 3
+        cur = MagicMock()
+        cur.fetchone = MagicMock(
+            side_effect=[(1,), (100,)] + [(0,), (5,)] * _MAX_COLUMNS_FOR_STATS
+        )
+        cur.fetchall = MagicMock(side_effect=[self._wide_columns(total)])
+
+        with mock_connection(cur):
+            result = make_manager().find_anomalies("test", "wide")
+
+        assert result["column_count"] == total
+        assert len(result["omitted_columns"]) == 3
+
+    def test_exactly_at_the_cap_omits_nothing(self):
+        from dbecho.db import _MAX_COLUMNS_FOR_STATS
+
+        cur = MagicMock()
+        cur.fetchone = MagicMock(
+            side_effect=[(1,), (100,)] + [(0,), (5,)] * _MAX_COLUMNS_FOR_STATS
+        )
+        cur.fetchall = MagicMock(
+            side_effect=[self._wide_columns(_MAX_COLUMNS_FOR_STATS)]
+        )
+
+        with mock_connection(cur):
+            stats = make_manager().get_table_stats("test", "exact")
+
+        assert "omitted_columns" not in stats
+        assert stats["column_count"] == _MAX_COLUMNS_FOR_STATS
+
+    def test_cap_helper_is_pure(self):
+        from dbecho.db import _MAX_COLUMNS_FOR_STATS
+
+        cols = self._wide_columns(_MAX_COLUMNS_FOR_STATS + 2)
+        kept, omitted = DatabaseManager._cap_profile_columns("wide", cols)
+        assert len(kept) == _MAX_COLUMNS_FOR_STATS
+        assert omitted == [
+            f"c{_MAX_COLUMNS_FOR_STATS}",
+            f"c{_MAX_COLUMNS_FOR_STATS + 1}",
+        ]
+        assert len(cols) == _MAX_COLUMNS_FOR_STATS + 2  # input untouched
+
+    def test_row_limit_refusal_is_actionable(self):
+        # Row count is a different kind of limit: profiling 50M rows exactly
+        # cannot be made cheap, so this one still refuses — but it must say
+        # which knob raises it and what to use instead.
+        cur = MagicMock()
+        cur.fetchone = MagicMock(side_effect=[(1,), (9_000_000,)])
+
+        with mock_connection(cur):
+            mgr = make_manager(max_profile_rows=5_000_000)
+            with pytest.raises(ValueError) as exc:
+                mgr.get_table_stats("test", "huge")
+
+        message = str(exc.value)
+        assert "9,000,000 rows" in message
+        assert "max_profile_rows" in message
+        for alternative in ("sample", "trend", "query"):
+            assert alternative in message
